@@ -1,0 +1,31 @@
+{
+  "name": "pi-opencode-subagents",
+  "version": "1.0.0",
+  "description": "Context-isolated subagent delegation with Git worktrees and bounded result envelopes for Pi",
+  "type": "module",
+  "main": "./src/index.ts",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "coding-agent",
+    "subagents",
+    "worktrees",
+    "git",
+    "isolation",
+    "token-optimization"
+  ],
+  "author": "arkseal",
+  "license": "MIT",
+  "scripts": {
+    "test": "bun test tests/**/*.test.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.74.0",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  }
+}
