@@ -8,7 +8,7 @@ import { createWorktree, cleanupWorktree } from "./worktree.js";
 import { formatTaskResultEnvelope } from "./envelope.js";
 import { checkSubagentDepth } from "./depth-guard.js";
 import { globalSubagentTracker } from "./tracker.js";
-import { parseSubagentJsonLine } from "./event-parser.js";
+import { SubagentEventParser } from "./event-parser.js";
 
 const SUBAGENT_DIR = path.join(os.tmpdir(), "pi-subagents");
 
@@ -62,6 +62,7 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
   let aborted = false;
   let lineBuffer = "";
   let lastAssistantText = "";
+  const parser = new SubagentEventParser();
 
   const child = spawn(
     "pi",
@@ -94,7 +95,7 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
 
     for (const line of lines) {
       if (!line.trim()) continue;
-      const parsed = parseSubagentJsonLine(line);
+      const parsed = parser.parseLine(line);
       if (parsed) {
         if (parsed.peek) {
           lastLine = parsed.peek;
