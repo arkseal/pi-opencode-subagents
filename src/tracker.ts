@@ -143,7 +143,7 @@ export class SubagentTracker {
       const spinner = SPINNER_FRAMES[this.frameIndex];
       this.uiContext.ui.setStatus(
         "subagents",
-        `⚡ ${spinner} ${runningCount} subagent${runningCount > 1 ? "s" : ""} active`
+        `${spinner} ${runningCount} subagent${runningCount > 1 ? "s" : ""} active`
       );
     } else {
       this.uiContext.ui.setStatus("subagents", undefined);
@@ -156,7 +156,7 @@ export class SubagentTracker {
         const text = new Text("", 0, 0);
         const spinner = theme.fg("accent", SPINNER_FRAMES[this.frameIndex]);
 
-        let titleStr = `⚡ Active Subagents (${runningCount} running`;
+        let titleStr = `Active Subagents (${runningCount} running`;
         if (completedCount > 0) {
           titleStr += ` · ${completedCount} completed`;
         }

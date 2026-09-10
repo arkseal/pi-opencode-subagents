@@ -38,7 +38,7 @@ describe("renderSubagentCall", () => {
     );
 
     const rendered = component.render(120).join(" ");
-    expect(rendered).toContain("⚡ Subagent");
+    expect(rendered).toContain("Subagent");
     expect(rendered).toContain("Search documentation and fix typos");
     expect(rendered).toContain("[isolated]");
   });

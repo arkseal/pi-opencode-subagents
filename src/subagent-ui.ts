@@ -28,7 +28,7 @@ export function cleanSubagentOutput(raw: string): string {
 export function renderSubagentCall(args: any, theme: any, context: any) {
   const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
 
-  let content = theme.fg("toolTitle", theme.bold("⚡ Subagent "));
+  let content = theme.fg("toolTitle", theme.bold("Subagent "));
 
   const title = args?.description || (args?.task ? extractShortTitle(args.task) : "Task");
   content += theme.fg("accent", `"${title}"`);
