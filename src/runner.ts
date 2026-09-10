@@ -7,6 +7,7 @@ import { randomUUID } from "node:crypto";
 import { createWorktree, cleanupWorktree } from "./worktree.js";
 import { formatTaskResultEnvelope } from "./envelope.js";
 import { checkSubagentDepth } from "./depth-guard.js";
+import { globalSubagentTracker } from "./tracker.js";
 
 const SUBAGENT_DIR = path.join(os.tmpdir(), "pi-subagents");
 
@@ -48,6 +49,14 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
   // Spawn child pi process in the isolated working directory
   const logFd = fsSync.openSync(logFile, "a");
 
+  globalSubagentTracker.registerStart({
+    id,
+    task: options.task,
+    description: options.description,
+    isolated,
+    logFile,
+  });
+
   let lastLine = "";
   let aborted = false;
 
@@ -81,6 +90,7 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
     const lines = text.trim().split("\n").filter((l) => l.trim().length > 0);
     if (lines.length > 0) {
       lastLine = lines[lines.length - 1];
+      globalSubagentTracker.updatePeek(id, lastLine);
     }
   };
 
@@ -138,6 +148,12 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
   }
 
   const status = aborted ? "aborted" : exitCode === 0 ? "completed" : "failed";
+
+  globalSubagentTracker.registerFinish(id, {
+    status,
+    exitCode,
+    durationMs,
+  });
 
   const envelope = formatTaskResultEnvelope({
     id,
