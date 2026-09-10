@@ -58,9 +58,15 @@ export function parseSubagentJsonLine(line: string): ParsedEventPeek | undefined
     if (ev.type === "tool_execution_end") {
       const name = ev.toolName || "tool";
       const status = ev.isError ? "failed" : "ok";
+      const content = ev.result?.content?.[0]?.text;
+      let transcriptLine = `<- [tool] ${name} (${status})`;
+      if (content && typeof content === "string") {
+        const preview = content.trim().slice(0, 300);
+        transcriptLine += `\n${preview}`;
+      }
       return {
         peek: `completed ${name} (${status})`,
-        transcriptLine: `<- [tool] ${name} (${status})`,
+        transcriptLine,
       };
     }
 
