@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { executeSubagent } from "./runner.js";
 
@@ -28,6 +29,19 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
       },
       { additionalProperties: false }
     ),
+    renderCall(args: any, theme: any, context: any) {
+      const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+      let content = theme.fg("toolTitle", theme.bold("subagent "));
+      if (args?.task) {
+        const preview = args.task.length > 70 ? `${args.task.slice(0, 67)}...` : args.task;
+        content += theme.fg("accent", `"${preview}"`);
+      }
+      if (args?.isolated === false) {
+        content += " " + theme.fg("warning", "[shared]");
+      }
+      text.setText(content);
+      return text;
+    },
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const depth = parseInt(process.env.PI_SUBAGENT_DEPTH ?? "0", 10);
       const result = await executeSubagent({
