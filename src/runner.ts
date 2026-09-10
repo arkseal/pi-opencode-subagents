@@ -8,6 +8,7 @@ import { createWorktree, cleanupWorktree } from "./worktree.js";
 import { formatTaskResultEnvelope } from "./envelope.js";
 import { checkSubagentDepth } from "./depth-guard.js";
 import { globalSubagentTracker } from "./tracker.js";
+import { parseSubagentJsonLine } from "./event-parser.js";
 
 const SUBAGENT_DIR = path.join(os.tmpdir(), "pi-subagents");
 
@@ -59,10 +60,12 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
 
   let lastLine = "";
   let aborted = false;
+  let lineBuffer = "";
+  let lastAssistantText = "";
 
   const child = spawn(
     "pi",
-    ["-p", "--no-session", options.task],
+    ["--mode", "json", "-p", "--no-session", options.task],
     {
       cwd: workDir,
       env: {
@@ -83,14 +86,35 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
   }
 
   const handleChunk = (chunk: Buffer) => {
-    try {
-      fsSync.writeSync(logFd, chunk);
-    } catch {}
     const text = chunk.toString("utf-8");
-    const lines = text.trim().split("\n").filter((l) => l.trim().length > 0);
-    if (lines.length > 0) {
-      lastLine = lines[lines.length - 1];
-      globalSubagentTracker.updatePeek(id, lastLine);
+    lineBuffer += text;
+
+    const lines = lineBuffer.split("\n");
+    lineBuffer = lines.pop() ?? "";
+
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const parsed = parseSubagentJsonLine(line);
+      if (parsed) {
+        if (parsed.peek) {
+          lastLine = parsed.peek;
+          globalSubagentTracker.updatePeek(id, lastLine);
+        }
+        if (parsed.transcriptLine) {
+          try {
+            fsSync.writeSync(logFd, `${parsed.transcriptLine}\n`);
+          } catch {}
+        }
+        if (parsed.finalAssistantText) {
+          lastAssistantText = parsed.finalAssistantText;
+        }
+      } else if (!line.startsWith("{")) {
+        lastLine = line.trim();
+        globalSubagentTracker.updatePeek(id, lastLine);
+        try {
+          fsSync.writeSync(logFd, `${line}\n`);
+        } catch {}
+      }
     }
   };
 
@@ -132,14 +156,15 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
   });
 
   const durationMs = Date.now() - startTime;
-  let summary = "";
-  try {
-    const rawOutput = await fs.readFile(logFile, "utf-8");
-    const lines = rawOutput.trim().split("\n");
-    // Grab the last 20 lines of the child's output as the summary
-    summary = lines.slice(-20).join("\n").trim() || "(Subagent finished with no output)";
-  } catch {
-    summary = `Subagent exited with code ${exitCode}`;
+  let summary = lastAssistantText;
+  if (!summary) {
+    try {
+      const rawOutput = await fs.readFile(logFile, "utf-8");
+      const lines = rawOutput.trim().split("\n");
+      summary = lines.slice(-20).join("\n").trim() || "(Subagent finished with no output)";
+    } catch {
+      summary = `Subagent exited with code ${exitCode}`;
+    }
   }
 
   let cleanupDetails;
