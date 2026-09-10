@@ -1,4 +1,6 @@
 import { Text, stripTerminalSequences, truncateToWidth } from "@earendil-works/pi-tui";
+import * as fs from "node:fs";
+import { formatTranscriptLines } from "./transcript-formatter.js";
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -135,9 +137,20 @@ export function renderSubagentResult(
 
     outputText += "\n" + theme.fg("dim", "─".repeat(50));
 
-    const fullLines = cleaned.split("\n");
-    for (const line of fullLines) {
-      outputText += `\n  ${theme.fg("toolOutput", line)}`;
+    let sourceLines: string[] = [];
+    if (details.logFile && fs.existsSync(details.logFile)) {
+      try {
+        sourceLines = fs.readFileSync(details.logFile, "utf-8").split("\n");
+      } catch {
+        sourceLines = cleaned.split("\n");
+      }
+    } else {
+      sourceLines = cleaned.split("\n");
+    }
+
+    const formattedTranscript = formatTranscriptLines(sourceLines, theme, 74);
+    for (const line of formattedTranscript) {
+      outputText += `\n${line}`;
     }
   }
 

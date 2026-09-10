@@ -40,7 +40,7 @@ describe("SubagentViewer", () => {
     });
 
     const rendered = viewer.render(80).join("\n");
-    expect(rendered).toContain("Subagent: [test_sub_1]");
+    expect(rendered).toContain("Subagent Transcript: [test_sub_1]");
     expect(rendered).toContain("Inspect directory files");
     expect(rendered).toContain("Line 1: Starting test");
     expect(rendered).toContain("Esc/q: Close");

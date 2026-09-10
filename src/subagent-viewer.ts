@@ -1,5 +1,6 @@
-import { type Component, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
+import { type Component, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import * as fs from "node:fs";
+import { formatTranscriptLines } from "./transcript-formatter.js";
 
 export interface SubagentViewerOptions {
   id: string;
@@ -23,7 +24,7 @@ export class SubagentViewer implements Component {
   private theme: any;
   private tui: any;
   private done: () => void;
-  private lines: string[] = [];
+  private rawLines: string[] = [];
   private scrollOffset = 0;
   private autoTail = true;
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -53,11 +54,7 @@ export class SubagentViewer implements Component {
     try {
       if (fs.existsSync(this.logPath)) {
         const content = fs.readFileSync(this.logPath, "utf-8");
-        this.lines = content.split("\n");
-        if (this.autoTail) {
-          const maxVisible = 16;
-          this.scrollOffset = Math.max(0, this.lines.length - maxVisible);
-        }
+        this.rawLines = content.split("\n");
       }
     } catch {}
   }
@@ -72,19 +69,26 @@ export class SubagentViewer implements Component {
       return;
     }
 
-    if (matchesKey(data, "up")) {
+    if (matchesKey(data, "up") || data === "k") {
       this.autoTail = false;
       this.scrollOffset = Math.max(0, this.scrollOffset - 1);
       this.tui.requestRender();
-    } else if (matchesKey(data, "down")) {
-      this.scrollOffset = Math.min(Math.max(0, this.lines.length - 5), this.scrollOffset + 1);
+    } else if (matchesKey(data, "down") || data === "j") {
+      this.scrollOffset++;
       this.tui.requestRender();
     } else if (matchesKey(data, "pageup")) {
       this.autoTail = false;
-      this.scrollOffset = Math.max(0, this.scrollOffset - 10);
+      this.scrollOffset = Math.max(0, this.scrollOffset - 12);
       this.tui.requestRender();
-    } else if (matchesKey(data, "pagedown")) {
-      this.scrollOffset = Math.min(Math.max(0, this.lines.length - 5), this.scrollOffset + 10);
+    } else if (matchesKey(data, "pagedown") || data === " ") {
+      this.scrollOffset += 12;
+      this.tui.requestRender();
+    } else if (matchesKey(data, "home") || data === "g") {
+      this.autoTail = false;
+      this.scrollOffset = 0;
+      this.tui.requestRender();
+    } else if (matchesKey(data, "end") || data === "G") {
+      this.autoTail = true;
       this.tui.requestRender();
     }
   }
@@ -93,51 +97,76 @@ export class SubagentViewer implements Component {
 
   render(width: number): string[] {
     const output: string[] = [];
-    const maxVisibleRows = 18;
+    const maxVisibleRows = 20;
+    const innerWidth = Math.max(30, width - 2);
 
-    // Header bar
-    const title = this.task.length > 50 ? `${this.task.slice(0, 47)}...` : this.task;
-    const headerTitle = ` Subagent: [${this.id}] "${title}" `;
+    // Format all lines through the transcript engine
+    const formattedLines = formatTranscriptLines(this.rawLines, this.theme, innerWidth - 4);
+    const totalLines = formattedLines.length;
+
+    // Handle auto-tailing when at the bottom or running
+    if (this.autoTail) {
+      this.scrollOffset = Math.max(0, totalLines - maxVisibleRows);
+    } else {
+      this.scrollOffset = Math.min(Math.max(0, totalLines - maxVisibleRows), this.scrollOffset);
+    }
+
+    // Header bar (breadcrumb styled like main agent TUI)
+    const title = this.task.length > 45 ? `${this.task.slice(0, 42)}...` : this.task;
+    const headerTitle = ` Subagent Transcript: [${this.id}] "${title}" `;
+    const headerDashes = Math.max(0, innerWidth - visibleWidth(headerTitle) - 1);
     output.push(
       this.theme.fg(
         "toolTitle",
-        `╭─${this.theme.bold(headerTitle)}${"─".repeat(Math.max(0, width - headerTitle.length - 3))}╮`
+        `╭─${this.theme.bold(headerTitle)}${"─".repeat(headerDashes)}╮`
       )
     );
 
-    // Status bar
-    const statusLine = ` Status: ${this.status} ${this.duration ? `(${this.duration})` : ""} · Log: ${this.logPath} `;
+    // Sub-header with status & log path
+    const statusIcon = this.status === "completed" ? this.theme.fg("success", "●") : this.status === "running" ? this.theme.fg("accent", "⠋") : this.theme.fg("error", "▲");
+    const statusText = ` ${statusIcon} Status: ${this.status} ${this.duration ? `(${this.duration})` : ""} · Log: ${this.logPath} `;
+    const padStatus = Math.max(0, innerWidth - visibleWidth(statusText));
     output.push(
-      `${this.theme.fg("toolTitle", "│")} ${this.theme.fg("dim", truncateToWidth(statusLine, width - 4))} ${this.theme.fg("toolTitle", "│")}`
+      `${this.theme.fg("toolTitle", "│")}${this.theme.fg("dim", statusText)}${" ".repeat(padStatus)}${this.theme.fg("toolTitle", "│")}`
     );
-    output.push(this.theme.fg("toolTitle", `├${"─".repeat(Math.max(0, width - 2))}┤`));
+    output.push(this.theme.fg("toolTitle", `├${"─".repeat(innerWidth)}┤`));
 
-    // Content lines
-    const visibleLines = this.lines.slice(this.scrollOffset, this.scrollOffset + maxVisibleRows);
-    if (visibleLines.length === 0) {
+    // Calculate scrollbar thumb position
+    const scrollMax = Math.max(1, totalLines - maxVisibleRows);
+    const scrollRatio = Math.min(1, Math.max(0, this.scrollOffset / scrollMax));
+    const thumbRow = Math.min(maxVisibleRows - 1, Math.floor(scrollRatio * maxVisibleRows));
+
+    // Content rows with scrollbar track
+    const visibleLines = formattedLines.slice(this.scrollOffset, this.scrollOffset + maxVisibleRows);
+
+    for (let r = 0; r < maxVisibleRows; r++) {
+      const line = r < visibleLines.length ? visibleLines[r] : "";
+      const scrollGlyph = totalLines > maxVisibleRows
+        ? r === thumbRow
+          ? this.theme.fg("accent", "█")
+          : this.theme.fg("dim", "│")
+        : " ";
+
+      const contentWidth = visibleWidth(line);
+      const paddingSpaces = Math.max(0, innerWidth - contentWidth - 3);
+
       output.push(
-        `${this.theme.fg("toolTitle", "│")} ${this.theme.fg("dim", "(No output recorded yet)")} ${this.theme.fg("toolTitle", "│")}`
+        `${this.theme.fg("toolTitle", "│")} ${line}${" ".repeat(paddingSpaces)} ${scrollGlyph}${this.theme.fg("toolTitle", "│")}`
       );
-    } else {
-      for (const line of visibleLines) {
-        const sanitized = line.replace(/\r/g, "");
-        const formatted = this.theme.fg("toolOutput", truncateToWidth(sanitized, width - 4));
-        output.push(`${this.theme.fg("toolTitle", "│")} ${formatted} ${this.theme.fg("toolTitle", "│")}`);
-      }
     }
 
-    // Pad if fewer lines
-    while (output.length < maxVisibleRows + 3) {
-      output.push(`${this.theme.fg("toolTitle", "│")}${" ".repeat(Math.max(0, width - 2))}${this.theme.fg("toolTitle", "│")}`);
-    }
+    // Footer divider
+    output.push(this.theme.fg("toolTitle", `├${"─".repeat(innerWidth)}┤`));
 
-    // Footer bar with keybinding hints
-    output.push(this.theme.fg("toolTitle", `├${"─".repeat(Math.max(0, width - 2))}┤`));
-    const footerText = ` Esc/q: Close · ↑/↓: Scroll · Lines ${this.scrollOffset + 1}-${Math.min(this.lines.length, this.scrollOffset + maxVisibleRows)} of ${this.lines.length} `;
+    // Navigation & location footer
+    const pct = totalLines <= maxVisibleRows ? 100 : Math.round(scrollRatio * 100);
+    const navHints = ` Esc/q: Close · ↑/↓/PgUp/PgDn: Scroll · Line ${this.scrollOffset + 1}-${Math.min(totalLines, this.scrollOffset + maxVisibleRows)} of ${totalLines} (${pct}%) `;
+    const padFooter = Math.max(0, innerWidth - visibleWidth(navHints));
+
     output.push(
-      `${this.theme.fg("toolTitle", "│")} ${this.theme.fg("dim", footerText)}${" ".repeat(Math.max(0, width - footerText.length - 3))}${this.theme.fg("toolTitle", "│")}`
+      `${this.theme.fg("toolTitle", "│")}${this.theme.fg("dim", navHints)}${" ".repeat(padFooter)}${this.theme.fg("toolTitle", "│")}`
     );
-    output.push(this.theme.fg("toolTitle", `╰${"─".repeat(Math.max(0, width - 2))}╯`));
+    output.push(this.theme.fg("toolTitle", `╰${"─".repeat(innerWidth)}╯`));
 
     return output;
   }
