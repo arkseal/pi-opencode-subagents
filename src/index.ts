@@ -3,6 +3,7 @@ import { Type } from "typebox";
 import { executeSubagent } from "./runner.js";
 import { renderSubagentCall, renderSubagentResult, cleanSubagentOutput } from "./subagent-ui.js";
 import { globalSubagentTracker } from "./tracker.js";
+import { SubagentViewer } from "./subagent-viewer.js";
 
 export { executeSubagent } from "./runner.js";
 export { createWorktree, cleanupWorktree } from "./worktree.js";
@@ -10,6 +11,7 @@ export { formatTaskResultEnvelope } from "./envelope.js";
 export { checkSubagentDepth, setMaxDepth } from "./depth-guard.js";
 export { renderSubagentCall, renderSubagentResult, cleanSubagentOutput } from "./subagent-ui.js";
 export { globalSubagentTracker, SubagentTracker } from "./tracker.js";
+export { SubagentViewer } from "./subagent-viewer.js";
 
 export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
   // Capture UI context on session lifecycle
@@ -19,39 +21,76 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
 
   // Register /subagents inspection command
   pi.registerCommand("subagents", {
-    description: "Inspect active and recent subagents and their progress",
+    description: "Peer into what subagents are currently working on or review past logs",
     handler: async (args, ctx) => {
       globalSubagentTracker.setUIContext(ctx);
       const active = globalSubagentTracker.getActiveList();
       const recent = globalSubagentTracker.getRecentList();
+      const all = [...active, ...recent];
 
-      if (active.length === 0 && recent.length === 0) {
+      if (all.length === 0) {
         ctx.ui.notify("No active or recent subagents found.", "info");
         return;
       }
 
-      const lines: string[] = [];
-      if (active.length > 0) {
-        lines.push(`Active Subagents (${active.length}):`);
-        for (const a of active) {
-          const elapsed = ((Date.now() - a.startTime) / 1000).toFixed(1);
-          lines.push(`  • [${a.id}] "${a.task.slice(0, 50)}" · ${elapsed}s (${a.status})`);
-          if (a.currentLine) lines.push(`    ↳ ${a.currentLine}`);
-          lines.push(`    Log: ${a.logFile}`);
+      if (!ctx.hasUI || ctx.mode !== "tui") {
+        const lines: string[] = all.map((s) => {
+          const dur = s.durationMs
+            ? `${(s.durationMs / 1000).toFixed(1)}s`
+            : `${((Date.now() - s.startTime) / 1000).toFixed(1)}s`;
+          return `[${s.id}] "${s.task.slice(0, 40)}" (${s.status}, ${dur}) - Log: ${s.logFile}`;
+        });
+        ctx.ui.notify(lines.join("\n"), "info");
+        return;
+      }
+
+      // Determine target subagent
+      let target: typeof all[0] | undefined;
+
+      const trimmedArg = args?.trim();
+      if (trimmedArg) {
+        target = all.find((s) => s.id === trimmedArg || s.id.includes(trimmedArg));
+      }
+
+      if (!target) {
+        if (all.length === 1) {
+          target = all[0];
+        } else {
+          const options = all.map((s) => {
+            const icon = s.status === "running" ? "⠋" : s.status === "completed" ? "●" : "▲";
+            const dur = s.durationMs
+              ? `${(s.durationMs / 1000).toFixed(1)}s`
+              : `${((Date.now() - s.startTime) / 1000).toFixed(1)}s`;
+            const title = s.description || (s.task.length > 40 ? `${s.task.slice(0, 37)}...` : s.task);
+            return `${icon} [${s.id}] "${title}" (${s.status}, ${dur})`;
+          });
+
+          const selected = await ctx.ui.select("Select a subagent to peer into:", options);
+          if (selected === undefined) return;
+          const idx = options.indexOf(selected);
+          target = all[idx];
         }
       }
 
-      if (recent.length > 0) {
-        if (lines.length > 0) lines.push("");
-        lines.push(`Recent Subagents (${recent.length}):`);
-        for (const r of recent.slice(0, 5)) {
-          const dur = r.durationMs ? `${(r.durationMs / 1000).toFixed(1)}s` : "n/a";
-          lines.push(`  • [${r.id}] "${r.task.slice(0, 50)}" · ${dur} (${r.status})`);
-          lines.push(`    Log: ${r.logFile}`);
-        }
-      }
+      if (!target) return;
 
-      ctx.ui.notify(lines.join("\n"), "info");
+      const dur = target.durationMs
+        ? `${(target.durationMs / 1000).toFixed(1)}s`
+        : `${((Date.now() - target.startTime) / 1000).toFixed(1)}s`;
+
+      await ctx.ui.custom((tui, theme, _kb, done) => {
+        return new SubagentViewer({
+          id: target.id,
+          task: target.task,
+          logPath: target.logFile,
+          isRunning: target.status === "running",
+          status: target.status,
+          duration: dur,
+          theme,
+          tui,
+          done,
+        });
+      });
     },
   });
 
