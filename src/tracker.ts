@@ -1,7 +1,8 @@
-import { Text } from "@earendil-works/pi-tui";
+import { Text, stripTerminalSequences, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const GRACE_PERIOD_MS = 3000;
+const BOX_WIDTH = 74;
 
 export interface TrackedSubagent {
   id: string;
@@ -12,6 +13,8 @@ export interface TrackedSubagent {
   durationMs?: number;
   status: "running" | "completed" | "failed" | "aborted";
   currentLine?: string;
+  currentPriority?: "low" | "normal" | "high";
+  lingerUntil?: number;
   isolated: boolean;
   logFile: string;
   exitCode?: number;
@@ -50,6 +53,7 @@ export class SubagentTracker {
       isolated: subagent.isolated,
       logFile: subagent.logFile,
       currentLine: "Initializing subagent process...",
+      currentPriority: "low",
     };
 
     this.active.set(subagent.id, tracked);
@@ -57,12 +61,41 @@ export class SubagentTracker {
     this.updateWidget();
   }
 
-  updatePeek(id: string, currentLine: string) {
+  updatePeek(
+    id: string,
+    currentLine: string,
+    priority: "low" | "normal" | "high" = "normal",
+    lingerMs = 0
+  ) {
     const item = this.active.get(id);
-    if (item && item.status === "running") {
-      item.currentLine = currentLine.trim();
-      this.updateWidget();
+    if (!item || item.status !== "running") return;
+
+    // Strictly sanitize: replace any newlines, carriage returns, or tabs with single space
+    const singleLine = currentLine.replace(/[\r\n\t]+/g, " ").trim();
+    if (!singleLine) return;
+
+    const now = Date.now();
+
+    // If a higher or equal priority peek is currently lingering, honor its linger window
+    if (item.lingerUntil && now < item.lingerUntil) {
+      // Low priority (thinking, code generation deltas) cannot overwrite lingering messages
+      if (priority === "low") {
+        return;
+      }
+      // If current is HIGH (e.g. tool completed) and new is NORMAL (new tool start),
+      // allow at least 1.2s before overriding so the user can read what just completed
+      if (item.currentPriority === "high" && priority === "normal") {
+        const timeRemaining = item.lingerUntil - now;
+        if (timeRemaining > 1300) {
+          return;
+        }
+      }
     }
+
+    item.currentLine = singleLine;
+    item.currentPriority = priority;
+    item.lingerUntil = lingerMs > 0 ? now + lingerMs : undefined;
+    this.updateWidget();
   }
 
   registerFinish(id: string, result: { status: "completed" | "failed" | "aborted"; exitCode?: number; durationMs?: number }) {
@@ -155,16 +188,18 @@ export class SubagentTracker {
       (_tui: any, theme: any) => {
         const text = new Text("", 0, 0);
         const spinner = theme.fg("accent", SPINNER_FRAMES[this.frameIndex]);
+        const innerWidth = BOX_WIDTH - 2;
 
-        let titleStr = `Active Subagents (${runningCount} running`;
+        let titleStr = ` Active Subagents (${runningCount} running`;
         if (completedCount > 0) {
           titleStr += ` · ${completedCount} completed`;
         }
-        titleStr += ")";
+        titleStr += ") ";
 
         const lines: string[] = [];
+        const headerDashes = Math.max(0, innerWidth - visibleWidth(titleStr) - 1);
         lines.push(
-          `${theme.fg("toolTitle", "╭─ ")}${theme.fg("toolTitle", theme.bold(titleStr))} ${theme.fg("dim", "─".repeat(Math.max(10, 60 - titleStr.length)))}${theme.fg("toolTitle", "╮")}`
+          `${theme.fg("toolTitle", "╭─")}${theme.fg("toolTitle", theme.bold(titleStr))}${theme.fg("dim", "─".repeat(headerDashes))}${theme.fg("toolTitle", "╮")}`
         );
 
         for (const s of items) {
@@ -172,34 +207,43 @@ export class SubagentTracker {
             ((s.endTime ?? Date.now()) - s.startTime) /
             1000
           ).toFixed(1);
-          const title = s.description || (s.task.length > 40 ? `${s.task.slice(0, 37)}...` : s.task);
+          const title = s.description || (s.task.length > 36 ? `${s.task.slice(0, 33)}...` : s.task);
 
           if (s.status === "running") {
             const icon = spinner;
             const mode = s.isolated ? theme.fg("dim", "[isolated]") : theme.fg("warning", "[shared]");
+            const mainContent = ` ${icon} ${theme.fg("accent", `[${s.id}]`)} ${theme.bold(`"${title}"`)} · ${theme.fg("dim", `${elapsedSec}s`)} ${mode}`;
+            const padMain = Math.max(0, innerWidth - visibleWidth(mainContent));
             lines.push(
-              `${theme.fg("toolTitle", "│")} ${icon} ${theme.fg("accent", `[${s.id}]`)} ${theme.bold(`"${title}"`)} · ${theme.fg("dim", `${elapsedSec}s`)} ${mode}`
+              `${theme.fg("toolTitle", "│")}${mainContent}${" ".repeat(padMain)}${theme.fg("toolTitle", "│")}`
             );
 
             if (s.currentLine) {
-              const peek = s.currentLine.length > 70 ? `${s.currentLine.slice(0, 67)}...` : s.currentLine;
+              const clean = stripTerminalSequences(s.currentLine.replace(/[\r\n\t]+/g, " ").trim());
+              const truncated = truncateToWidth(clean, innerWidth - 6);
+              const peekContent = `   ${theme.fg("muted", "↳")} ${theme.fg("dim", truncated)}`;
+              const padPeek = Math.max(0, innerWidth - visibleWidth(peekContent));
               lines.push(
-                `${theme.fg("toolTitle", "│")}   ${theme.fg("muted", "↳")} ${theme.fg("dim", peek)}`
+                `${theme.fg("toolTitle", "│")}${peekContent}${" ".repeat(padPeek)}${theme.fg("toolTitle", "│")}`
               );
             }
           } else if (s.status === "completed") {
+            const doneContent = ` ${theme.fg("success", "●")} ${theme.fg("dim", `[${s.id}]`)} ${theme.fg("toolTitle", `"${title}"`)} · ${theme.fg("success", `done in ${elapsedSec}s`)}`;
+            const padDone = Math.max(0, innerWidth - visibleWidth(doneContent));
             lines.push(
-              `${theme.fg("toolTitle", "│")} ${theme.fg("success", "●")} ${theme.fg("dim", `[${s.id}]`)} ${theme.fg("toolTitle", `"${title}"`)} · ${theme.fg("success", `done in ${elapsedSec}s`)}`
+              `${theme.fg("toolTitle", "│")}${doneContent}${" ".repeat(padDone)}${theme.fg("toolTitle", "│")}`
             );
           } else {
+            const failContent = ` ${theme.fg("error", "▲")} ${theme.fg("dim", `[${s.id}]`)} ${theme.fg("error", `"${title}"`)} · ${theme.fg("error", `failed (exit ${s.exitCode ?? 1})`)}`;
+            const padFail = Math.max(0, innerWidth - visibleWidth(failContent));
             lines.push(
-              `${theme.fg("toolTitle", "│")} ${theme.fg("error", "▲")} ${theme.fg("dim", `[${s.id}]`)} ${theme.fg("error", `"${title}"`)} · ${theme.fg("error", `failed (exit ${s.exitCode ?? 1})`)}`
+              `${theme.fg("toolTitle", "│")}${failContent}${" ".repeat(padFail)}${theme.fg("toolTitle", "│")}`
             );
           }
         }
 
         lines.push(
-          `${theme.fg("toolTitle", "╰" + "─".repeat(68) + "╯")}`
+          `${theme.fg("toolTitle", "╰" + "─".repeat(innerWidth) + "╯")}`
         );
 
         text.setText(lines.join("\n"));

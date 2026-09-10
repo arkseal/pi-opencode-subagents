@@ -1,5 +1,7 @@
 export interface ParsedEventPeek {
   peek?: string;
+  priority?: "low" | "normal" | "high";
+  lingerMs?: number;
   transcriptLine?: string;
   finalAssistantText?: string;
 }
@@ -55,17 +57,21 @@ export class SubagentEventParser {
         if (sub?.type === "thinking_delta" || sub?.type === "thinking_start") {
           return {
             peek: "thinking...",
+            priority: "low",
           };
         }
         if (sub?.type === "text_delta" && sub.delta) {
-          const text = sub.delta.trim();
-          if (text.length > 5) {
-            const preview = text.length > 55 ? `${text.slice(0, 52)}...` : text;
-            return {
-              peek: preview,
-              transcriptLine: sub.delta,
-            };
-          }
+          const delta = sub.delta;
+          // Check if outputting code or markdown code block
+          const isCode =
+            delta.includes("```") ||
+            /^(?:import|export|const|let|var|function|class|def|return|if|for|while)\b/m.test(delta.trim());
+          const peek = isCode ? "generating code..." : "drafting response...";
+          return {
+            peek,
+            priority: "low",
+            transcriptLine: delta,
+          };
         }
       }
 
@@ -147,6 +153,8 @@ export class SubagentEventParser {
 
     return {
       peek,
+      priority: "normal",
+      lingerMs: 1200,
       transcriptLine: `-> [tool] ${name} ${transcriptDetail}`.trim(),
     };
   }
@@ -163,6 +171,8 @@ export class SubagentEventParser {
       const errSnippet = errFirstLine.length > 45 ? `${errFirstLine.slice(0, 42)}...` : errFirstLine;
       return {
         peek: `${name} failed: ${errSnippet}`,
+        priority: "high",
+        lingerMs: 2500,
         transcriptLine: `<- [tool] ${name} (error: ${errFirstLine})`,
       };
     }
@@ -239,6 +249,8 @@ export class SubagentEventParser {
 
     return {
       peek,
+      priority: "high",
+      lingerMs: 2500,
       transcriptLine,
     };
   }

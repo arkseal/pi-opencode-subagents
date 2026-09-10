@@ -177,4 +177,21 @@ describe("SubagentEventParser", () => {
     const endParsed = parser.parseLine(endEv);
     expect(endParsed?.peek).toBe("read failed: ENOENT: no such file or directory");
   });
+
+  it("safely handles code output deltas without injecting multiline code into peek", () => {
+    const parser = new SubagentEventParser();
+
+    const codeEv = JSON.stringify({
+      type: "message_update",
+      assistantMessageEvent: {
+        type: "text_delta",
+        delta: "```typescript\nfunction solve(): number {\n  return 42;\n}\n```",
+      },
+    });
+
+    const parsed = parser.parseLine(codeEv);
+    expect(parsed?.peek).toBe("generating code...");
+    expect(parsed?.priority).toBe("low");
+    expect(parsed?.transcriptLine).toContain("function solve()");
+  });
 });

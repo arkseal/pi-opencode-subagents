@@ -106,4 +106,41 @@ describe("SubagentTracker", () => {
     expect(recent[0].status).toBe("completed");
     expect(recent[0].durationMs).toBe(1500);
   });
+
+  it("strips newlines from peek text to prevent TUI box misalignment", () => {
+    tracker.registerStart({
+      id: "agent-code",
+      task: "Code task",
+      isolated: true,
+      logFile: "/tmp/agent-code.log",
+    });
+
+    tracker.updatePeek("agent-code", "const a = 1;\nconst b = 2;\nreturn a + b;");
+
+    const active = tracker.getActiveList();
+    expect(active[0].currentLine).not.toContain("\n");
+    expect(active[0].currentLine).toBe("const a = 1; const b = 2; return a + b;");
+  });
+
+  it("lingers completed tool output and blocks low-priority updates during linger window", () => {
+    tracker.registerStart({
+      id: "agent-linger",
+      task: "Linger test",
+      isolated: true,
+      logFile: "/tmp/agent-linger.log",
+    });
+
+    // High priority tool completion with 2000ms linger
+    tracker.updatePeek("agent-linger", 'globbed "*.ts" (5 files found)', "high", 2000);
+
+    let active = tracker.getActiveList();
+    expect(active[0].currentLine).toBe('globbed "*.ts" (5 files found)');
+
+    // Low priority update immediately following (like thinking or text delta)
+    tracker.updatePeek("agent-linger", "thinking...", "low");
+
+    active = tracker.getActiveList();
+    // Must remain lingering on the tool completion!
+    expect(active[0].currentLine).toBe('globbed "*.ts" (5 files found)');
+  });
 });

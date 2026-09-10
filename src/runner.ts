@@ -99,7 +99,7 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
       if (parsed) {
         if (parsed.peek) {
           lastLine = parsed.peek;
-          globalSubagentTracker.updatePeek(id, lastLine);
+          globalSubagentTracker.updatePeek(id, lastLine, parsed.priority, parsed.lingerMs);
         }
         if (parsed.transcriptLine) {
           try {
@@ -110,8 +110,9 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
           lastAssistantText = parsed.finalAssistantText;
         }
       } else if (!line.startsWith("{")) {
-        lastLine = line.trim();
-        globalSubagentTracker.updatePeek(id, lastLine);
+        const clean = line.replace(/[\r\n\t]+/g, " ").trim();
+        lastLine = clean;
+        globalSubagentTracker.updatePeek(id, lastLine, "normal", 1000);
         try {
           fsSync.writeSync(logFd, `${line}\n`);
         } catch {}

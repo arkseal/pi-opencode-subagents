@@ -1,4 +1,4 @@
-import { Text } from "@earendil-works/pi-tui";
+import { Text, stripTerminalSequences, truncateToWidth } from "@earendil-works/pi-tui";
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -73,9 +73,8 @@ export function renderSubagentResult(
     let progressText = `${spinner} ${theme.bold("Running subagent")} ${theme.fg("dim", `(${elapsedSec}s)`)}`;
 
     if (details.currentLine) {
-      const line = details.currentLine.length > 75
-        ? `${details.currentLine.slice(0, 72)}...`
-        : details.currentLine;
+      const clean = stripTerminalSequences(details.currentLine.replace(/[\r\n\t]+/g, " ").trim());
+      const line = truncateToWidth(clean, 70);
       progressText += `\n  ${theme.fg("muted", "↳")} ${theme.fg("dim", line)}`;
     } else {
       progressText += `\n  ${theme.fg("muted", "↳")} ${theme.fg("dim", "Executing tasks...")}`;
