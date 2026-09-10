@@ -55,4 +55,24 @@ describe("formatTranscriptLines", () => {
     expect(joined).toContain("│ console.log(answer);");
     expect(joined).toContain("└");
   });
+
+  it("wraps long lines without truncating or inserting ellipses", () => {
+    const raw = [
+      "This is a very long line of output from a command that contains detailed information which must be preserved completely instead of being cut off with an ellipsis.",
+      "```bash",
+      "npm install --save-dev @earendil-works/pi-coding-agent @earendil-works/pi-tui @sinclair/typebox",
+      "```",
+    ];
+
+    const lines = formatTranscriptLines(raw, mockTheme, 40);
+    const joined = lines.join("\n");
+
+    // Must NOT contain ellipsis from truncation
+    expect(joined).not.toContain("...");
+    // Must contain parts from wrapped lines
+    expect(joined).toContain("This is a very long");
+    expect(joined).toContain("preserved completely");
+    expect(joined).toContain("npm install");
+    expect(joined).toContain("@sinclair/typebox");
+  });
 });

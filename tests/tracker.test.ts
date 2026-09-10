@@ -34,7 +34,7 @@ describe("SubagentTracker", () => {
     tracker.setUIContext(mockCtx);
   });
 
-  it("registers subagent start and sets pinned widget below editor", () => {
+  it("registers subagent start and updates status indicator", () => {
     tracker.registerStart({
       id: "agent-1",
       task: "Search for nodejs releases",
@@ -48,8 +48,6 @@ describe("SubagentTracker", () => {
     expect(active[0].id).toBe("agent-1");
     expect(active[0].status).toBe("running");
 
-    expect(capturedPlacement).toBe("belowEditor");
-    expect(typeof capturedWidget).toBe("function");
     expect(capturedStatus).toContain("1 subagent active");
   });
 
