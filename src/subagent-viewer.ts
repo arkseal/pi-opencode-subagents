@@ -39,9 +39,11 @@ export class SubagentViewer implements Component {
     this.tracker = opts.tracker;
     this.done = opts.done;
 
-    // Enable mouse reporting so mouse wheel scrolls the modal instead of the outer terminal chat
+    // Enter alternate screen buffer and enable SGR mouse tracking.
+    // In alternate screen buffer, the terminal emulator completely disables window scrollback,
+    // protecting the background chat and routing all mouse wheel events directly to handleInput!
     try {
-      this.tui?.terminal?.write?.("\x1b[?1000h\x1b[?1006h");
+      process.stdout.write("\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[2J\x1b[H");
     } catch {}
 
     this.reloadLines();
@@ -86,9 +88,9 @@ export class SubagentViewer implements Component {
       this.timer = null;
     }
 
-    // Disable mouse tracking and return terminal to default mode
+    // Disable mouse tracking and return terminal from alternate screen to main chat
     try {
-      this.tui?.terminal?.write?.("\x1b[?1006l\x1b[?1000l");
+      process.stdout.write("\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?1049l");
     } catch {}
   }
 
@@ -168,7 +170,7 @@ export class SubagentViewer implements Component {
 
     const output: string[] = [];
     const termRows = typeof this.tui?.terminal?.rows === "number" ? this.tui.terminal.rows : 30;
-    const maxVisibleRows = Math.max(10, Math.min(40, termRows - 8));
+    const maxVisibleRows = Math.max(10, termRows - 6);
     const innerWidth = Math.max(30, width - 2);
 
     // Format all lines through the transcript engine

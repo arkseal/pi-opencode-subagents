@@ -210,6 +210,12 @@ export class SubagentTracker {
     return this.recent;
   }
 
+  restoreRecent(items: TrackedSubagent[]) {
+    const existingIds = new Set(this.recent.map((r) => r.id));
+    const toAdd = items.filter((item) => !existingIds.has(item.id));
+    this.recent = [...toAdd, ...this.recent].slice(0, 50);
+  }
+
   private ensureTicker() {
     if (this.ticker) return;
     this.ticker = setInterval(() => {

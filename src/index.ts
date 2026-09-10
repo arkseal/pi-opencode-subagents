@@ -14,9 +14,25 @@ export { globalSubagentTracker, SubagentTracker } from "./tracker.js";
 export { SubagentViewer } from "./subagent-viewer.js";
 
 export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
-  // Capture UI context on session lifecycle
-  pi.on("session_start", (_event, ctx) => {
+  // Capture UI context and restore subagents on session lifecycle
+  pi.on("session_start", async (_event, ctx) => {
     globalSubagentTracker.setUIContext(ctx);
+
+    // Restore saved subagents from session JSONL history
+    try {
+      if (ctx.sessionManager && typeof ctx.sessionManager.getEntries === "function") {
+        const entries = ctx.sessionManager.getEntries();
+        const restored: any[] = [];
+        for (const entry of entries) {
+          if (entry.type === "custom" && (entry as any).customType === "subagent_record" && (entry as any).data) {
+            restored.push((entry as any).data);
+          }
+        }
+        if (restored.length > 0) {
+          globalSubagentTracker.restoreRecent(restored);
+        }
+      }
+    } catch {}
   });
 
   // Register /subagents inspection command
@@ -127,6 +143,25 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
         signal,
         onUpdate,
       });
+
+      // Persist subagent metadata to session JSONL so it survives session exit and rejoin
+      try {
+        if (ctx.sessionManager && typeof ctx.sessionManager.appendCustomEntry === "function") {
+          ctx.sessionManager.appendCustomEntry("subagent_record", {
+            id: result.details.id,
+            task: result.details.task,
+            description: result.details.description,
+            startTime: Date.now() - (result.details.durationMs ?? 0),
+            endTime: Date.now(),
+            durationMs: result.details.durationMs,
+            status: result.details.status,
+            isolated: result.details.isolated,
+            logFile: result.details.logFile,
+            exitCode: result.details.exitCode,
+            currentLine: "Done",
+          });
+        }
+      } catch {}
 
       return {
         content: [{ type: "text", text: result.output }],

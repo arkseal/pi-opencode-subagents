@@ -10,11 +10,19 @@ import { checkSubagentDepth } from "./depth-guard.js";
 import { globalSubagentTracker } from "./tracker.js";
 import { SubagentEventParser } from "./event-parser.js";
 
-const SUBAGENT_DIR = path.join(os.tmpdir(), "pi-subagents");
-
-function ensureSubagentDir() {
-  if (!fsSync.existsSync(SUBAGENT_DIR)) {
-    fsSync.mkdirSync(SUBAGENT_DIR, { recursive: true });
+function getSubagentDir(): string {
+  const homePiDir = path.join(os.homedir(), ".pi", "agent", "subagents");
+  try {
+    if (!fsSync.existsSync(homePiDir)) {
+      fsSync.mkdirSync(homePiDir, { recursive: true });
+    }
+    return homePiDir;
+  } catch {
+    const tmpDir = path.join(os.tmpdir(), "pi-subagents");
+    if (!fsSync.existsSync(tmpDir)) {
+      fsSync.mkdirSync(tmpDir, { recursive: true });
+    }
+    return tmpDir;
   }
 }
 
@@ -30,10 +38,10 @@ export interface SpawnSubagentOptions {
 
 export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ output: string; details: any }> {
   checkSubagentDepth(options.currentDepth ?? 0);
-  ensureSubagentDir();
+  const subagentDir = getSubagentDir();
 
   const id = `subagent_${randomUUID().slice(0, 8)}`;
-  const logFile = path.join(SUBAGENT_DIR, `${id}.log`);
+  const logFile = path.join(subagentDir, `${id}.log`);
   const startTime = Date.now();
 
   const isolated = options.isolated ?? true;
