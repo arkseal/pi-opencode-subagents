@@ -1,6 +1,7 @@
-import { stripTerminalSequences, truncateToWidth } from "@earendil-works/pi-tui";
+import { type Component, stripTerminalSequences, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const GRACE_PERIOD_MS = 1200;
 
 export interface TrackedSubagent {
   id: string;
@@ -18,19 +19,90 @@ export interface TrackedSubagent {
   exitCode?: number;
 }
 
+class PinnedSubagentsWidget implements Component {
+  constructor(private tracker: SubagentTracker, private theme: any) {}
+
+  invalidate() {}
+
+  render(width: number): string[] {
+    const items = this.tracker.getActiveList();
+    if (items.length === 0) return [];
+
+    const runningCount = items.filter((s) => s.status === "running").length;
+    const completedCount = items.length - runningCount;
+    const spinner = this.theme.fg("accent", SPINNER_FRAMES[this.tracker.getFrameIndex()]);
+
+    const lines: string[] = [];
+    // Keep a 2-column safety margin from the sidebar divider so the right border is 100% visible and never wraps
+    const boxWidth = Math.max(25, width - 2);
+    const innerContentWidth = boxWidth - 4;
+
+    // 1. Top Border
+    const titlePrefix = " Subagents ";
+    const countStr = `(${runningCount} running${completedCount > 0 ? ` · ${completedCount} done` : ""}) `;
+    const headerPrefix = `${this.theme.fg("dim", "╭─")}${this.theme.bold(this.theme.fg("toolTitle", titlePrefix))}${this.theme.fg("accent", countStr)}`;
+    const headerLen = visibleWidth(titlePrefix) + visibleWidth(countStr);
+    const ruleLen = Math.max(2, boxWidth - headerLen - 3);
+    lines.push(`${headerPrefix}${this.theme.fg("dim", "─".repeat(ruleLen) + "╮")}`);
+
+    // 2. Active / Completed Items
+    for (const s of items) {
+      const elapsedSec = (
+        ((s.endTime ?? Date.now()) - s.startTime) /
+        1000
+      ).toFixed(1);
+
+      const maxTitleLen = Math.max(12, Math.floor(innerContentWidth * 0.42));
+      const title = s.description || (s.task.length > maxTitleLen ? `${s.task.slice(0, maxTitleLen - 3)}...` : s.task);
+
+      if (s.status === "running") {
+        const icon = spinner;
+        const mode = s.isolated ? this.theme.fg("dim", "[isolated]") : this.theme.fg("warning", "[shared]");
+        const mainLine = `  ${icon} ${this.theme.fg("accent", `[${s.id}]`)} ${this.theme.bold(`"${title}"`)} · ${this.theme.fg("dim", `${elapsedSec}s`)} ${mode}`;
+        
+        const truncated = truncateToWidth(mainLine, innerContentWidth);
+        const padSpaces = Math.max(0, innerContentWidth - visibleWidth(truncated));
+        lines.push(`${this.theme.fg("dim", "│")} ${truncated}${" ".repeat(padSpaces)} ${this.theme.fg("dim", "│")}`);
+
+        if (s.currentLine) {
+          const clean = stripTerminalSequences(s.currentLine.replace(/[\r\n\t]+/g, " ").trim());
+          const peekText = `    ${this.theme.fg("muted", "↳")} ${this.theme.fg("dim", clean)}`;
+          const truncatedPeek = truncateToWidth(peekText, innerContentWidth);
+          const padPeek = Math.max(0, innerContentWidth - visibleWidth(truncatedPeek));
+          lines.push(`${this.theme.fg("dim", "│")} ${truncatedPeek}${" ".repeat(padPeek)} ${this.theme.fg("dim", "│")}`);
+        }
+      } else if (s.status === "completed") {
+        const doneLine = `  ${this.theme.fg("success", "●")} ${this.theme.fg("dim", `[${s.id}]`)} ${this.theme.fg("toolTitle", `"${title}"`)} · ${this.theme.fg("success", `done in ${elapsedSec}s`)}`;
+        const truncated = truncateToWidth(doneLine, innerContentWidth);
+        const padSpaces = Math.max(0, innerContentWidth - visibleWidth(truncated));
+        lines.push(`${this.theme.fg("dim", "│")} ${truncated}${" ".repeat(padSpaces)} ${this.theme.fg("dim", "│")}`);
+      } else {
+        const failLine = `  ${this.theme.fg("error", "▲")} ${this.theme.fg("dim", `[${s.id}]`)} ${this.theme.fg("error", `"${title}"`)} · ${this.theme.fg("error", `failed (exit ${s.exitCode ?? 1})`)}`;
+        const truncated = truncateToWidth(failLine, innerContentWidth);
+        const padSpaces = Math.max(0, innerContentWidth - visibleWidth(truncated));
+        lines.push(`${this.theme.fg("dim", "│")} ${truncated}${" ".repeat(padSpaces)} ${this.theme.fg("dim", "│")}`);
+      }
+    }
+
+    // 3. Bottom Border (completely closed on both ends)
+    lines.push(this.theme.fg("dim", "╰" + "─".repeat(Math.max(2, boxWidth - 2)) + "╯"));
+    return lines;
+  }
+}
+
 export class SubagentTracker {
   private active = new Map<string, TrackedSubagent>();
   private recent: TrackedSubagent[] = [];
   private ticker: ReturnType<typeof setInterval> | null = null;
+  private clearTimer: ReturnType<typeof setTimeout> | null = null;
   private frameIndex = 0;
   private uiContext: any = null;
+  private isWidgetMounted = false;
   private sidebarRegistered = false;
 
   setUIContext(ctx: any) {
     this.uiContext = ctx;
     this.ensureSidebarPanel();
-    // Clean up any stale legacy widget below the editor
-    this.clearStaleWidget();
   }
 
   getFrameIndex(): number {
@@ -44,6 +116,11 @@ export class SubagentTracker {
     isolated: boolean;
     logFile: string;
   }) {
+    if (this.clearTimer) {
+      clearTimeout(this.clearTimer);
+      this.clearTimer = null;
+    }
+
     const tracked: TrackedSubagent = {
       id: subagent.id,
       task: subagent.task,
@@ -59,7 +136,7 @@ export class SubagentTracker {
     this.active.set(subagent.id, tracked);
 
     this.ensureSidebarPanel();
-    this.clearStaleWidget();
+    this.ensureWidgetMounted();
     this.ensureTicker();
     this.notifyRender();
   }
@@ -106,15 +183,23 @@ export class SubagentTracker {
       item.durationMs = result.durationMs ?? (item.endTime - item.startTime);
       item.currentLine = result.status === "completed" ? "Done" : `Exited with code ${result.exitCode ?? 1}`;
       this.recent = [item, ...this.recent.filter((r) => r.id !== id)].slice(0, 15);
-      this.active.delete(id);
     }
 
     const hasRunning = Array.from(this.active.values()).some((s) => s.status === "running");
     if (!hasRunning) {
       this.stopTicker();
-      this.clearStatus();
+      this.notifyRender();
+
+      // Grace period to show completion in the box before unmounting
+      if (this.clearTimer) clearTimeout(this.clearTimer);
+      this.clearTimer = setTimeout(() => {
+        this.active.clear();
+        this.unmountWidget();
+        this.notifyRender();
+      }, GRACE_PERIOD_MS);
+    } else {
+      this.notifyRender();
     }
-    this.notifyRender();
   }
 
   getActiveList(): TrackedSubagent[] {
@@ -140,19 +225,26 @@ export class SubagentTracker {
     }
   }
 
-  private clearStaleWidget() {
-    if (!this.uiContext?.hasUI) return;
+  private ensureWidgetMounted() {
+    if (this.isWidgetMounted || !this.uiContext?.hasUI) return;
     try {
-      this.uiContext.ui.setWidget("subagents-pinned", undefined);
+      this.uiContext.ui.setWidget(
+        "subagents-pinned",
+        (_tui: any, theme: any) => new PinnedSubagentsWidget(this, theme),
+        { placement: "belowEditor" }
+      );
+      this.isWidgetMounted = true;
     } catch {}
   }
 
-  private clearStatus() {
+  private unmountWidget() {
     if (!this.uiContext?.hasUI) return;
     try {
+      this.uiContext.ui.setWidget("subagents-pinned", undefined);
       this.uiContext.ui.setStatus("subagents", undefined);
       this.uiContext.ui.requestRender();
     } catch {}
+    this.isWidgetMounted = false;
   }
 
   private notifyRender() {

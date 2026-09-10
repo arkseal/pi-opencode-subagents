@@ -71,4 +71,32 @@ describe("SubagentViewer", () => {
     viewer.handleInput("q");
     expect(closed).toBe(true);
   });
+
+  it("handles mouse wheel scroll up and down", () => {
+    const tracker = new SubagentTracker();
+    let renderRequested = 0;
+    const viewer = new SubagentViewer({
+      id: "test_sub_3",
+      task: "Scroll test",
+      logPath: tmpLog,
+      theme: mockTheme,
+      tui: {
+        terminal: { write: () => {} },
+        requestRender: () => {
+          renderRequested++;
+        },
+      },
+      tracker,
+      done: () => {},
+    });
+
+    // Send mouse wheel up (SGR 1006)
+    viewer.handleInput("\x1b[<64;20;10M");
+    expect(renderRequested).toBeGreaterThan(0);
+
+    const prevCount = renderRequested;
+    // Send mouse wheel down (SGR 1006)
+    viewer.handleInput("\x1b[<65;20;10M");
+    expect(renderRequested).toBeGreaterThan(prevCount);
+  });
 });

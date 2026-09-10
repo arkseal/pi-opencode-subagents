@@ -28,6 +28,7 @@ export class SubagentViewer implements Component {
   private autoTail = true;
   private frameIndex = 0;
   private timer: ReturnType<typeof setInterval> | null = null;
+  private isDisposed = false;
 
   constructor(opts: SubagentViewerOptions) {
     this.id = opts.id;
@@ -38,6 +39,11 @@ export class SubagentViewer implements Component {
     this.tracker = opts.tracker;
     this.done = opts.done;
 
+    // Enable mouse reporting so mouse wheel scrolls the modal instead of the outer terminal chat
+    try {
+      this.tui?.terminal?.write?.("\x1b[?1000h\x1b[?1006h");
+    } catch {}
+
     this.reloadLines();
 
     // Live update ticker: animates spinner, ticks timer, and streams new transcript lines
@@ -47,7 +53,6 @@ export class SubagentViewer implements Component {
 
       const sub = this.getSubagentInfo();
       if (sub && sub.status !== "running" && this.timer) {
-        // One final reload after completion, then stop ticker
         clearInterval(this.timer);
         this.timer = null;
       }
@@ -72,16 +77,61 @@ export class SubagentViewer implements Component {
     } catch {}
   }
 
+  private cleanup() {
+    if (this.isDisposed) return;
+    this.isDisposed = true;
+
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+
+    // Disable mouse tracking and return terminal to default mode
+    try {
+      this.tui?.terminal?.write?.("\x1b[?1006l\x1b[?1000l");
+    } catch {}
+  }
+
+  dispose() {
+    this.cleanup();
+  }
+
   handleInput(data: string) {
-    if (matchesKey(data, "escape") || data === "q" || data === "Q" || matchesKey(data, "return")) {
-      if (this.timer) {
-        clearInterval(this.timer);
-        this.timer = null;
-      }
+    // 1. Mouse wheel scrolling
+    // SGR 1006: \x1b[<64;...M (wheel up), \x1b[<65;...M (wheel down)
+    // Legacy X11: \x1b[M`... (wheel up), \x1b[Ma... (wheel down)
+    if (data.includes("\x1b[<64;") || data.includes("\x1b[M`")) {
+      this.autoTail = false;
+      this.scrollOffset = Math.max(0, this.scrollOffset - 3);
+      this.tui.requestRender();
+      return;
+    }
+
+    if (data.includes("\x1b[<65;") || data.includes("\x1b[Ma")) {
+      this.scrollOffset += 3;
+      this.tui.requestRender();
+      return;
+    }
+
+    // Ignore other mouse events (clicks, mouse move) so they don't trigger keys
+    if (data.startsWith("\x1b[<") || data.startsWith("\x1b[M")) {
+      return;
+    }
+
+    // 2. Close modal
+    if (
+      matchesKey(data, "escape") ||
+      data === "q" ||
+      data === "Q" ||
+      matchesKey(data, "return") ||
+      matchesKey(data, "ctrl+c")
+    ) {
+      this.cleanup();
       this.done();
       return;
     }
 
+    // 3. Keyboard navigation
     if (matchesKey(data, "up") || data === "k") {
       this.autoTail = false;
       this.scrollOffset = Math.max(0, this.scrollOffset - 1);
@@ -91,10 +141,10 @@ export class SubagentViewer implements Component {
       this.tui.requestRender();
     } else if (matchesKey(data, "pageup")) {
       this.autoTail = false;
-      this.scrollOffset = Math.max(0, this.scrollOffset - 12);
+      this.scrollOffset = Math.max(0, this.scrollOffset - 10);
       this.tui.requestRender();
     } else if (matchesKey(data, "pagedown") || data === " ") {
-      this.scrollOffset += 12;
+      this.scrollOffset += 10;
       this.tui.requestRender();
     } else if (matchesKey(data, "home") || data === "g") {
       this.autoTail = false;
@@ -117,7 +167,8 @@ export class SubagentViewer implements Component {
     const currentAction = sub?.currentLine;
 
     const output: string[] = [];
-    const maxVisibleRows = 20;
+    const termRows = typeof this.tui?.terminal?.rows === "number" ? this.tui.terminal.rows : 30;
+    const maxVisibleRows = Math.max(10, Math.min(40, termRows - 8));
     const innerWidth = Math.max(30, width - 2);
 
     // Format all lines through the transcript engine
@@ -131,8 +182,9 @@ export class SubagentViewer implements Component {
       this.scrollOffset = Math.min(Math.max(0, totalLines - maxVisibleRows), this.scrollOffset);
     }
 
-    // 1. Header bar (breadcrumb styled like main agent TUI)
-    const title = this.task.length > 45 ? `${this.task.slice(0, 42)}...` : this.task;
+    // 1. Header bar
+    const maxTitleLen = Math.max(16, innerWidth - visibleWidth(` Subagent Transcript: [${this.id}] `) - 8);
+    const title = this.task.length > maxTitleLen ? `${this.task.slice(0, maxTitleLen - 3)}...` : this.task;
     const headerTitle = ` Subagent Transcript: [${this.id}] "${title}" `;
     const headerDashes = Math.max(0, innerWidth - visibleWidth(headerTitle) - 1);
     output.push(
@@ -199,7 +251,7 @@ export class SubagentViewer implements Component {
 
     // 7. Navigation & location footer
     const pct = totalLines <= maxVisibleRows ? 100 : Math.round(scrollRatio * 100);
-    const navHints = ` Esc/q: Close · ↑/↓/PgUp/PgDn: Scroll · Line ${this.scrollOffset + 1}-${Math.min(totalLines, this.scrollOffset + maxVisibleRows)} of ${totalLines} (${pct}%) `;
+    const navHints = ` Esc/q: Close · Scroll/PgUp/PgDn: Navigate · Line ${this.scrollOffset + 1}-${Math.min(totalLines, this.scrollOffset + maxVisibleRows)} of ${totalLines} (${pct}%) `;
     const padFooter = Math.max(0, innerWidth - visibleWidth(navHints));
 
     output.push(
