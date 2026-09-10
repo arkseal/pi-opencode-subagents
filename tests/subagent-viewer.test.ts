@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { SubagentViewer } from "../src/subagent-viewer";
+import { SubagentTracker } from "../src/tracker";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
@@ -25,15 +26,21 @@ describe("SubagentViewer", () => {
 
   it("renders header, log content, and keybinding footer", () => {
     let closed = false;
+    const tracker = new SubagentTracker();
+    tracker.registerStart({
+      id: "test_sub_1",
+      task: "Inspect directory files",
+      isolated: true,
+      logFile: tmpLog,
+    });
+
     const viewer = new SubagentViewer({
       id: "test_sub_1",
       task: "Inspect directory files",
       logPath: tmpLog,
-      isRunning: false,
-      status: "completed",
-      duration: "2.5s",
       theme: mockTheme,
       tui: { requestRender: () => {} },
+      tracker,
       done: () => {
         closed = true;
       },
@@ -48,14 +55,14 @@ describe("SubagentViewer", () => {
 
   it("closes when escape or q is pressed", () => {
     let closed = false;
+    const tracker = new SubagentTracker();
     const viewer = new SubagentViewer({
       id: "test_sub_2",
       task: "Quick task",
       logPath: tmpLog,
-      isRunning: false,
-      status: "completed",
       theme: mockTheme,
       tui: { requestRender: () => {} },
+      tracker,
       done: () => {
         closed = true;
       },

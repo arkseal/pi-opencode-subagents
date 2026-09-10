@@ -1,16 +1,17 @@
 import { type Component, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import * as fs from "node:fs";
 import { formatTranscriptLines } from "./transcript-formatter.js";
+import type { SubagentTracker, TrackedSubagent } from "./tracker.js";
+
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 export interface SubagentViewerOptions {
   id: string;
   task: string;
   logPath: string;
-  isRunning: boolean;
-  status: string;
-  duration?: string;
   theme: any;
   tui: any;
+  tracker: SubagentTracker;
   done: () => void;
 }
 
@@ -18,36 +19,48 @@ export class SubagentViewer implements Component {
   private id: string;
   private task: string;
   private logPath: string;
-  private isRunning: boolean;
-  private status: string;
-  private duration?: string;
   private theme: any;
   private tui: any;
+  private tracker: SubagentTracker;
   private done: () => void;
   private rawLines: string[] = [];
   private scrollOffset = 0;
   private autoTail = true;
+  private frameIndex = 0;
   private timer: ReturnType<typeof setInterval> | null = null;
 
   constructor(opts: SubagentViewerOptions) {
     this.id = opts.id;
     this.task = opts.task;
     this.logPath = opts.logPath;
-    this.isRunning = opts.isRunning;
-    this.status = opts.status;
-    this.duration = opts.duration;
     this.theme = opts.theme;
     this.tui = opts.tui;
+    this.tracker = opts.tracker;
     this.done = opts.done;
 
     this.reloadLines();
 
-    if (this.isRunning) {
-      this.timer = setInterval(() => {
-        this.reloadLines();
-        this.tui.requestRender();
-      }, 200);
-    }
+    // Live update ticker: animates spinner, ticks timer, and streams new transcript lines
+    this.timer = setInterval(() => {
+      this.frameIndex = (this.frameIndex + 1) % SPINNER_FRAMES.length;
+      this.reloadLines();
+
+      const sub = this.getSubagentInfo();
+      if (sub && sub.status !== "running" && this.timer) {
+        // One final reload after completion, then stop ticker
+        clearInterval(this.timer);
+        this.timer = null;
+      }
+
+      this.tui.requestRender();
+    }, 100);
+  }
+
+  private getSubagentInfo(): TrackedSubagent | undefined {
+    return (
+      this.tracker.getActiveList().find((s) => s.id === this.id) ??
+      this.tracker.getRecentList().find((s) => s.id === this.id)
+    );
   }
 
   private reloadLines() {
@@ -96,6 +109,13 @@ export class SubagentViewer implements Component {
   invalidate() {}
 
   render(width: number): string[] {
+    const sub = this.getSubagentInfo();
+    const status = sub?.status ?? "completed";
+    const startTime = sub?.startTime ?? Date.now();
+    const endTime = sub?.endTime;
+    const elapsedSec = (((endTime ?? Date.now()) - startTime) / 1000).toFixed(1) + "s";
+    const currentAction = sub?.currentLine;
+
     const output: string[] = [];
     const maxVisibleRows = 20;
     const innerWidth = Math.max(30, width - 2);
@@ -111,7 +131,7 @@ export class SubagentViewer implements Component {
       this.scrollOffset = Math.min(Math.max(0, totalLines - maxVisibleRows), this.scrollOffset);
     }
 
-    // Header bar (breadcrumb styled like main agent TUI)
+    // 1. Header bar (breadcrumb styled like main agent TUI)
     const title = this.task.length > 45 ? `${this.task.slice(0, 42)}...` : this.task;
     const headerTitle = ` Subagent Transcript: [${this.id}] "${title}" `;
     const headerDashes = Math.max(0, innerWidth - visibleWidth(headerTitle) - 1);
@@ -122,30 +142,49 @@ export class SubagentViewer implements Component {
       )
     );
 
-    // Sub-header with status & log path
-    const statusIcon = this.status === "completed" ? this.theme.fg("success", "●") : this.status === "running" ? this.theme.fg("accent", "⠋") : this.theme.fg("error", "▲");
-    const statusText = ` ${statusIcon} Status: ${this.status} ${this.duration ? `(${this.duration})` : ""} · Log: ${this.logPath} `;
+    // 2. Sub-header with live animated spinner, real-time timer, status & log path
+    const spinner = this.theme.fg("accent", SPINNER_FRAMES[this.frameIndex]);
+    const statusIcon =
+      status === "completed"
+        ? this.theme.fg("success", "●")
+        : status === "running"
+        ? spinner
+        : this.theme.fg("error", "▲");
+
+    const statusText = ` ${statusIcon} Status: ${status} (${elapsedSec}) · Log: ${this.logPath} `;
     const padStatus = Math.max(0, innerWidth - visibleWidth(statusText));
     output.push(
       `${this.theme.fg("toolTitle", "│")}${this.theme.fg("dim", statusText)}${" ".repeat(padStatus)}${this.theme.fg("toolTitle", "│")}`
     );
+
+    // 3. If running and an active tool/step peek is present, display it live
+    if (status === "running" && currentAction) {
+      const cleanAction = truncateToWidth(currentAction, innerWidth - 8);
+      const actionText = `   ${this.theme.fg("muted", "↳")} ${this.theme.fg("dim", cleanAction)} `;
+      const padAction = Math.max(0, innerWidth - visibleWidth(actionText));
+      output.push(
+        `${this.theme.fg("toolTitle", "│")}${actionText}${" ".repeat(padAction)}${this.theme.fg("toolTitle", "│")}`
+      );
+    }
+
     output.push(this.theme.fg("toolTitle", `├${"─".repeat(innerWidth)}┤`));
 
-    // Calculate scrollbar thumb position
+    // 4. Calculate scrollbar thumb position
     const scrollMax = Math.max(1, totalLines - maxVisibleRows);
     const scrollRatio = Math.min(1, Math.max(0, this.scrollOffset / scrollMax));
     const thumbRow = Math.min(maxVisibleRows - 1, Math.floor(scrollRatio * maxVisibleRows));
 
-    // Content rows with scrollbar track
+    // 5. Content rows with scrollbar track
     const visibleLines = formattedLines.slice(this.scrollOffset, this.scrollOffset + maxVisibleRows);
 
     for (let r = 0; r < maxVisibleRows; r++) {
       const line = r < visibleLines.length ? visibleLines[r] : "";
-      const scrollGlyph = totalLines > maxVisibleRows
-        ? r === thumbRow
-          ? this.theme.fg("accent", "█")
-          : this.theme.fg("dim", "│")
-        : " ";
+      const scrollGlyph =
+        totalLines > maxVisibleRows
+          ? r === thumbRow
+            ? this.theme.fg("accent", "█")
+            : this.theme.fg("dim", "│")
+          : " ";
 
       const contentWidth = visibleWidth(line);
       const paddingSpaces = Math.max(0, innerWidth - contentWidth - 3);
@@ -155,10 +194,10 @@ export class SubagentViewer implements Component {
       );
     }
 
-    // Footer divider
+    // 6. Footer divider
     output.push(this.theme.fg("toolTitle", `├${"─".repeat(innerWidth)}┤`));
 
-    // Navigation & location footer
+    // 7. Navigation & location footer
     const pct = totalLines <= maxVisibleRows ? 100 : Math.round(scrollRatio * 100);
     const navHints = ` Esc/q: Close · ↑/↓/PgUp/PgDn: Scroll · Line ${this.scrollOffset + 1}-${Math.min(totalLines, this.scrollOffset + maxVisibleRows)} of ${totalLines} (${pct}%) `;
     const padFooter = Math.max(0, innerWidth - visibleWidth(navHints));

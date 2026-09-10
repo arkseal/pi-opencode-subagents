@@ -74,20 +74,14 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
 
       if (!target) return;
 
-      const dur = target.durationMs
-        ? `${(target.durationMs / 1000).toFixed(1)}s`
-        : `${((Date.now() - target.startTime) / 1000).toFixed(1)}s`;
-
       await ctx.ui.custom((tui, theme, _kb, done) => {
         return new SubagentViewer({
           id: target.id,
           task: target.task,
           logPath: target.logFile,
-          isRunning: target.status === "running",
-          status: target.status,
-          duration: dur,
           theme,
           tui,
+          tracker: globalSubagentTracker,
           done,
         });
       });
