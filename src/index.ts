@@ -1,12 +1,13 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { executeSubagent } from "./runner.js";
+import { renderSubagentCall, renderSubagentResult, cleanSubagentOutput } from "./subagent-ui.js";
 
 export { executeSubagent } from "./runner.js";
 export { createWorktree, cleanupWorktree } from "./worktree.js";
 export { formatTaskResultEnvelope } from "./envelope.js";
 export { checkSubagentDepth, setMaxDepth } from "./depth-guard.js";
+export { renderSubagentCall, renderSubagentResult, cleanSubagentOutput } from "./subagent-ui.js";
 
 export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
   pi.registerTool({
@@ -20,6 +21,11 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
         task: Type.String({
           description: "Detailed description of the task for the subagent to perform autonomously",
         }),
+        description: Type.Optional(
+          Type.String({
+            description: "A short 3-5 word summary/title of the task for the UI header",
+          })
+        ),
         isolated: Type.Optional(
           Type.Boolean({
             description:
@@ -29,26 +35,18 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
       },
       { additionalProperties: false }
     ),
-    renderCall(args: any, theme: any, context: any) {
-      const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
-      let content = theme.fg("toolTitle", theme.bold("subagent "));
-      if (args?.task) {
-        const preview = args.task.length > 70 ? `${args.task.slice(0, 67)}...` : args.task;
-        content += theme.fg("accent", `"${preview}"`);
-      }
-      if (args?.isolated === false) {
-        content += " " + theme.fg("warning", "[shared]");
-      }
-      text.setText(content);
-      return text;
-    },
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    renderCall: renderSubagentCall,
+    renderResult: renderSubagentResult,
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const depth = parseInt(process.env.PI_SUBAGENT_DEPTH ?? "0", 10);
       const result = await executeSubagent({
         task: params.task,
+        description: params.description,
         cwd: ctx.cwd,
         isolated: params.isolated ?? true,
         currentDepth: depth,
+        signal,
+        onUpdate,
       });
 
       return {

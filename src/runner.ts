@@ -18,9 +18,12 @@ function ensureSubagentDir() {
 
 export interface SpawnSubagentOptions {
   task: string;
+  description?: string;
   cwd: string;
   isolated?: boolean; // defaults to true
   currentDepth?: number; // defaults to 0
+  onUpdate?: (update: { content: Array<{ type: "text"; text: string }>; details: any }) => void;
+  signal?: AbortSignal;
 }
 
 export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ output: string; details: any }> {
@@ -45,6 +48,9 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
   // Spawn child pi process in the isolated working directory
   const logFd = fsSync.openSync(logFile, "a");
 
+  let lastLine = "";
+  let aborted = false;
+
   const child = spawn(
     "pi",
     ["-p", "--no-session", options.task],
@@ -54,18 +60,60 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
         ...process.env,
         PI_SUBAGENT_DEPTH: String((options.currentDepth ?? 0) + 1),
       },
-      stdio: ["ignore", logFd, logFd],
+      stdio: ["ignore", "pipe", "pipe"],
     }
   );
 
+  if (options.signal) {
+    options.signal.addEventListener("abort", () => {
+      aborted = true;
+      try {
+        child.kill("SIGTERM");
+      } catch {}
+    }, { once: true });
+  }
+
+  const handleChunk = (chunk: Buffer) => {
+    try {
+      fsSync.writeSync(logFd, chunk);
+    } catch {}
+    const text = chunk.toString("utf-8");
+    const lines = text.trim().split("\n").filter((l) => l.trim().length > 0);
+    if (lines.length > 0) {
+      lastLine = lines[lines.length - 1];
+    }
+  };
+
+  child.stdout?.on("data", handleChunk);
+  child.stderr?.on("data", handleChunk);
+
+  // Periodic progress ticker for UI
+  const progressTimer = setInterval(() => {
+    options.onUpdate?.({
+      content: [{ type: "text", text: lastLine || "Subagent working..." }],
+      details: {
+        id,
+        task: options.task,
+        description: options.description,
+        status: "running",
+        elapsedMs: Date.now() - startTime,
+        currentLine: lastLine,
+        isolated,
+        logFile,
+      },
+    });
+  }, 200);
+
   const exitCode: number = await new Promise((resolve) => {
     child.on("close", (code) => {
+      clearInterval(progressTimer);
       try {
         fsSync.closeSync(logFd);
       } catch {}
       resolve(code ?? 1);
     });
     child.on("error", () => {
+      clearInterval(progressTimer);
       try {
         fsSync.closeSync(logFd);
       } catch {}
@@ -89,9 +137,11 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
     cleanupDetails = await cleanupWorktree(options.cwd, worktreeInfo, options.task);
   }
 
+  const status = aborted ? "aborted" : exitCode === 0 ? "completed" : "failed";
+
   const envelope = formatTaskResultEnvelope({
     id,
-    status: exitCode === 0 ? "completed" : "failed",
+    status,
     durationMs,
     summary,
     logFilePath: logFile,
@@ -101,11 +151,20 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
     output: envelope,
     details: {
       id,
+      task: options.task,
+      description: options.description,
+      status,
       exitCode,
       durationMs,
       logFile,
       isolated,
+      worktree: worktreeInfo ? {
+        path: worktreeInfo.path,
+        branch: worktreeInfo.branch,
+        hasChanges: cleanupDetails?.hasChanges,
+      } : undefined,
       cleanup: cleanupDetails,
+      summary,
     },
   };
 }
