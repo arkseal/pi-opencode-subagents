@@ -108,12 +108,15 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
     name: "subagent",
     label: "Subagent",
     description:
-      "Delegate a multi-step task to an autonomous child agent in an isolated context. Runs in a temporary Git worktree to protect the workspace, and returns only a concise <task-result> summary to keep parent context clean.",
-    promptSnippet: "Delegate autonomous research or coding tasks to an isolated subagent",
+      "Delegate tasks to autonomous child agents in isolated Git worktrees. Call multiple subagents in parallel in a single turn for independent tasks.",
+    promptSnippet: "Delegate tasks to isolated subagents (supports parallel calls)",
+    promptGuidelines: [
+      "Dispatch multiple subagent calls in parallel within a single turn for independent tasks.",
+    ],
     parameters: Type.Object(
       {
         task: Type.String({
-          description: "Detailed description of the task for the subagent to perform autonomously",
+          description: "Task description for the subagent to perform autonomously",
         }),
         description: Type.Optional(
           Type.String({

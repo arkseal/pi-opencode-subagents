@@ -17,7 +17,7 @@
   "author": "arkseal",
   "license": "MIT",
   "scripts": {
-    "test": "bun test tests/**/*.test.ts"
+    "test": "bun test ./tests/*.test.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.74.0",
