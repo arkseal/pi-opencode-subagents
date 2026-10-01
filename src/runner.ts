@@ -74,7 +74,7 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
 
   const child = spawn(
     "pi",
-    ["--mode", "json", "-p", "--no-session", options.task],
+    ["--mode", "json", "-p", "--no-session", "-a", options.task],
     {
       cwd: workDir,
       env: {
@@ -144,9 +144,10 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
         currentLine: lastLine,
         isolated,
         logFile,
+        stats: parser.getStats(),
       },
     });
-  }, 200);
+  }, 100);
 
   const exitCode: number = await new Promise((resolve) => {
     child.on("close", (code) => {
@@ -183,11 +184,13 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
   }
 
   const status = aborted ? "aborted" : exitCode === 0 ? "completed" : "failed";
+  const stats = parser.getStats();
 
   globalSubagentTracker.registerFinish(id, {
     status,
     exitCode,
     durationMs,
+    stats,
   });
 
   const envelope = formatTaskResultEnvelope({
@@ -196,6 +199,7 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
     durationMs,
     summary,
     logFilePath: logFile,
+    stats,
   });
 
   return {
@@ -216,6 +220,7 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
       } : undefined,
       cleanup: cleanupDetails,
       summary,
+      stats,
     },
   };
 }

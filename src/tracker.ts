@@ -1,4 +1,6 @@
 import { type Component, stripTerminalSequences, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import type { SubagentStats } from "./event-parser.js";
+import { loadSubagentSettings, saveSubagentSettings, type SubagentSettings, type SubagentDisplayMode } from "./config.js";
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const GRACE_PERIOD_MS = 1200;
@@ -17,10 +19,13 @@ export interface TrackedSubagent {
   isolated: boolean;
   logFile: string;
   exitCode?: number;
+  stats?: SubagentStats;
 }
 
 class PinnedSubagentsWidget implements Component {
-  constructor(private tracker: SubagentTracker, private theme: any) {}
+  constructor(private tracker: SubagentTracker, private theme: any) {
+    tracker.setTheme(theme);
+  }
 
   invalidate() {}
 
@@ -99,6 +104,76 @@ export class SubagentTracker {
   private uiContext: any = null;
   private isWidgetMounted = false;
   private sidebarRegistered = false;
+  private theme: any = null;
+  private settings: SubagentSettings = loadSubagentSettings();
+
+  setTheme(theme: any) {
+    this.theme = theme;
+  }
+
+  getDisplayMode(): SubagentDisplayMode {
+    return this.settings.displayMode;
+  }
+
+  setDisplayMode(mode: SubagentDisplayMode) {
+    this.settings.displayMode = mode;
+    this.settings.sidebarEnabled = mode === "sidebar" || mode === "both";
+    this.settings.widgetEnabled = mode === "input" || mode === "both";
+    saveSubagentSettings(this.settings);
+
+    // Update sidebar panel
+    if (!this.settings.sidebarEnabled) {
+      try {
+        const g = globalThis as any;
+        g.__PI_SIDEBAR_TUI__?.unregisterPanel?.("subagents");
+        this.sidebarRegistered = false;
+      } catch {}
+    } else {
+      this.ensureSidebarPanel();
+    }
+
+    // Update pinned widget above text input
+    if (!this.settings.widgetEnabled) {
+      this.unmountWidget();
+    } else if (this.active.size > 0) {
+      this.ensureWidgetMounted();
+    }
+
+    this.notifyRender();
+  }
+
+  cycleDisplayMode(): SubagentDisplayMode {
+    const current = this.getDisplayMode();
+    const nextMode: SubagentDisplayMode =
+      current === "input" ? "sidebar" :
+      current === "sidebar" ? "both" : "input";
+    this.setDisplayMode(nextMode);
+    return nextMode;
+  }
+
+  isSidebarEnabled(): boolean {
+    return this.settings.sidebarEnabled;
+  }
+
+  setSidebarEnabled(enabled: boolean) {
+    if (enabled) {
+      this.setDisplayMode(this.settings.displayMode === "input" ? "both" : this.settings.displayMode);
+    } else {
+      this.setDisplayMode("input");
+    }
+  }
+
+  isWidgetEnabled(): boolean {
+    return this.settings.widgetEnabled;
+  }
+
+  setWidgetEnabled(enabled: boolean) {
+    if (enabled) {
+      this.setDisplayMode(this.settings.displayMode === "sidebar" ? "both" : this.settings.displayMode);
+    } else {
+      this.setDisplayMode("sidebar");
+    }
+  }
 
   setUIContext(ctx: any) {
     this.uiContext = ctx;
@@ -106,7 +181,7 @@ export class SubagentTracker {
   }
 
   getFrameIndex(): number {
-    return this.frameIndex;
+    return Math.floor(Date.now() / 90) % SPINNER_FRAMES.length;
   }
 
   registerStart(subagent: {
@@ -174,7 +249,7 @@ export class SubagentTracker {
     this.notifyRender();
   }
 
-  registerFinish(id: string, result: { status: "completed" | "failed" | "aborted"; exitCode?: number; durationMs?: number }) {
+  registerFinish(id: string, result: { status: "completed" | "failed" | "aborted"; exitCode?: number; durationMs?: number; stats?: SubagentStats }) {
     const item = this.active.get(id);
     if (item) {
       item.status = result.status;
@@ -182,6 +257,9 @@ export class SubagentTracker {
       item.endTime = Date.now();
       item.durationMs = result.durationMs ?? (item.endTime - item.startTime);
       item.currentLine = result.status === "completed" ? "Done" : `Exited with code ${result.exitCode ?? 1}`;
+      if (result.stats) {
+        item.stats = result.stats;
+      }
       this.recent = [item, ...this.recent.filter((r) => r.id !== id)].slice(0, 15);
     }
 
@@ -216,12 +294,62 @@ export class SubagentTracker {
     this.recent = [...toAdd, ...this.recent].slice(0, 50);
   }
 
+  getCumulativeStats(): {
+    subagentCount: number;
+    tokensIn: number;
+    tokensOut: number;
+    cacheRead: number;
+    cacheWrite: number;
+    totalTokens: number;
+    cost: number;
+    toolCalls: number;
+    turns: number;
+  } {
+    let tokensIn = 0;
+    let tokensOut = 0;
+    let cacheRead = 0;
+    let cacheWrite = 0;
+    let cost = 0;
+    let toolCalls = 0;
+    let turns = 0;
+    let count = 0;
+
+    const all = [...this.active.values(), ...this.recent];
+    const seen = new Set<string>();
+    for (const s of all) {
+      if (seen.has(s.id)) continue;
+      seen.add(s.id);
+      count++;
+      if (s.stats) {
+        tokensIn += s.stats.tokensIn;
+        tokensOut += s.stats.tokensOut;
+        cacheRead += s.stats.cacheRead;
+        cacheWrite += s.stats.cacheWrite;
+        cost += s.stats.cost ?? 0;
+        toolCalls += s.stats.toolCalls;
+        turns += s.stats.turns;
+      }
+    }
+
+    return {
+      subagentCount: count,
+      tokensIn,
+      tokensOut,
+      cacheRead,
+      cacheWrite,
+      totalTokens: tokensIn + tokensOut + cacheRead + cacheWrite,
+      cost,
+      toolCalls,
+      turns,
+    };
+  }
+
   private ensureTicker() {
     if (this.ticker) return;
     this.ticker = setInterval(() => {
-      this.frameIndex = (this.frameIndex + 1) % SPINNER_FRAMES.length;
+      this.frameIndex = Math.floor(Date.now() / 90) % SPINNER_FRAMES.length;
       this.notifyRender();
-    }, 150);
+    }, 90);
   }
 
   private stopTicker() {
@@ -232,7 +360,7 @@ export class SubagentTracker {
   }
 
   private ensureWidgetMounted() {
-    if (this.isWidgetMounted || !this.uiContext?.hasUI) return;
+    if (!this.settings.widgetEnabled || this.isWidgetMounted || !this.uiContext?.hasUI) return;
     try {
       this.uiContext.ui.setWidget(
         "subagents-pinned",
@@ -284,6 +412,7 @@ export class SubagentTracker {
   }
 
   private ensureSidebarPanel() {
+    if (!this.settings.sidebarEnabled) return;
     if (this.sidebarRegistered) return;
     const g = globalThis as any;
     if (typeof g.__PI_SIDEBAR_TUI__?.registerPanel === "function") {
@@ -292,6 +421,7 @@ export class SubagentTracker {
           id: "subagents",
           order: 15,
           render: (_ctx: any, width: number) => {
+            if (!this.settings.sidebarEnabled) return [];
             const items = Array.from(this.active.values());
             if (items.length === 0) return [];
 
@@ -300,16 +430,57 @@ export class SubagentTracker {
             const lines: string[] = [];
 
             const safeW = Math.max(10, width - 2);
-            lines.push(`Subagents (${running} active${completed > 0 ? `, ${completed} done` : ""})`);
+
+            // Styling helpers: prefer sidebar TUI api, then live pi theme, then ansi codes
+            const sidebarAPI = g.__PI_SIDEBAR_TUI__;
+            const fg = (color: string, str: string) => {
+              if (typeof sidebarAPI?.fg === "function") return sidebarAPI.fg(color, str);
+              if (typeof this.theme?.fg === "function") return this.theme.fg(color, str);
+              if (color === "success") return `\x1b[32m${str}\x1b[39m`;
+              if (color === "error") return `\x1b[31m${str}\x1b[39m`;
+              if (color === "accent") return `\x1b[33m${str}\x1b[39m`;
+              if (color === "dim") return `\x1b[2m${str}\x1b[22m`;
+              return str;
+            };
+            const dim = (str: string) => fg("dim", str);
+            const bold = (str: string) => {
+              if (typeof sidebarAPI?.bold === "function") return sidebarAPI.bold(str);
+              if (typeof this.theme?.bold === "function") return this.theme.bold(str);
+              return `\x1b[1m${str}\x1b[22m`;
+            };
+
+            // Synchronize spinner frame with sidebar context if available, otherwise match 90ms clock
+            const currentFrameIndex = _ctx?.spinnerFrame !== undefined
+              ? ((_ctx.spinnerFrame % SPINNER_FRAMES.length) + SPINNER_FRAMES.length) % SPINNER_FRAMES.length
+              : this.getFrameIndex();
+            const currentSpinner = SPINNER_FRAMES[currentFrameIndex];
+
+            // Header line
+            const countLabel = running > 0
+              ? dim(` (${running} active${completed > 0 ? `, ${completed} done` : ""})`)
+              : completed > 0
+                ? fg("success", ` (${completed} done)`)
+                : "";
+            lines.push(bold(" Subagents") + countLabel);
+            lines.push(dim("─".repeat(Math.max(0, safeW))));
 
             for (const s of items) {
               const elapsed = (((s.endTime ?? Date.now()) - s.startTime) / 1000).toFixed(1);
-              const icon = s.status === "running" ? SPINNER_FRAMES[this.frameIndex] : s.status === "completed" ? "●" : "▲";
               const title = s.description || (s.task.length > 24 ? `${s.task.slice(0, 21)}...` : s.task);
-              lines.push(truncateToWidth(`  ${icon} "${title}" (${elapsed}s)`, safeW));
-              if (s.currentLine && s.status === "running") {
-                const clean = s.currentLine.replace(/[\r\n\t]+/g, " ").trim();
-                lines.push(truncateToWidth(`    ↳ ${clean}`, safeW));
+
+              if (s.status === "running") {
+                const icon = fg("accent", currentSpinner);
+                lines.push(truncateToWidth(`  ${icon} ${bold(`"${title}"`)} ${dim(`(${elapsed}s)`)}`, safeW));
+                if (s.currentLine) {
+                  const clean = s.currentLine.replace(/[\r\n\t]+/g, " ").trim();
+                  lines.push(truncateToWidth(`    ↳ ${dim(clean)}`, safeW));
+                }
+              } else if (s.status === "completed") {
+                const icon = fg("success", "●");
+                lines.push(truncateToWidth(`  ${icon} "${title}" · ${fg("success", `done in ${elapsed}s`)}`, safeW));
+              } else {
+                const icon = fg("error", "▲");
+                lines.push(truncateToWidth(`  ${icon} ${fg("error", `"${title}"`)} · ${fg("error", `failed`)}`, safeW));
               }
             }
             return lines;

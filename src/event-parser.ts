@@ -1,9 +1,22 @@
+export interface SubagentStats {
+  tokensIn: number;
+  tokensOut: number;
+  cacheRead: number;
+  cacheWrite: number;
+  totalTokens: number;
+  cost?: number;
+  turns: number;
+  toolCalls: number;
+  model?: string;
+}
+
 export interface ParsedEventPeek {
   peek?: string;
   priority?: "low" | "normal" | "high";
   lingerMs?: number;
   transcriptLine?: string;
   finalAssistantText?: string;
+  stats?: SubagentStats;
 }
 
 export interface PendingToolCall {
@@ -13,6 +26,17 @@ export interface PendingToolCall {
 
 export class SubagentEventParser {
   private pendingCalls = new Map<string, PendingToolCall>();
+  private stats: SubagentStats = {
+    tokensIn: 0,
+    tokensOut: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 0,
+    cost: 0,
+    turns: 0,
+    toolCalls: 0,
+  };
+  private currentTurnUsage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; cost?: { total?: number } };
 
   parseLine(line: string): ParsedEventPeek | undefined {
     const trimmed = line.trim();
@@ -23,6 +47,7 @@ export class SubagentEventParser {
 
       // 1. Tool execution started
       if (ev.type === "tool_execution_start") {
+        this.stats.toolCalls++;
         const id = ev.toolCallId || "";
         const name = ev.toolName || "tool";
         const args = ev.args || {};
@@ -53,11 +78,15 @@ export class SubagentEventParser {
 
       // 3. Thinking / Generation delta
       if (ev.type === "message_update") {
+        if (ev.usage) {
+          this.currentTurnUsage = ev.usage;
+        }
         const sub = ev.assistantMessageEvent;
         if (sub?.type === "thinking_delta" || sub?.type === "thinking_start") {
           return {
             peek: "thinking...",
             priority: "low",
+            stats: this.getStats(),
           };
         }
         if (sub?.type === "text_delta" && sub.delta) {
@@ -71,12 +100,60 @@ export class SubagentEventParser {
             peek,
             priority: "low",
             transcriptLine: delta,
+            stats: this.getStats(),
           };
         }
       }
 
-      // 4. Agent ended (capture final assistant response)
+      // 4. Message lifecycle tracking for tokens / stats
+      if (ev.type === "message_start") {
+        if (ev.message?.role === "assistant") {
+          this.currentTurnUsage = undefined;
+          if (ev.message?.model) this.stats.model = ev.message.model;
+        }
+      }
+
+      if (ev.type === "message_end") {
+        if (ev.message?.role === "assistant") {
+          if (ev.message?.model) this.stats.model = ev.message.model;
+          const usage = ev.message?.usage || this.currentTurnUsage;
+          if (usage) {
+            this.stats.tokensIn += usage.input ?? 0;
+            this.stats.tokensOut += usage.output ?? 0;
+            this.stats.cacheRead += usage.cacheRead ?? 0;
+            this.stats.cacheWrite += usage.cacheWrite ?? 0;
+            if (typeof usage.cost?.total === "number") {
+              this.stats.cost = (this.stats.cost ?? 0) + usage.cost.total;
+            }
+            this.stats.totalTokens = this.stats.tokensIn + this.stats.tokensOut + this.stats.cacheRead + this.stats.cacheWrite;
+            this.currentTurnUsage = undefined;
+          }
+        }
+      }
+
+      // 5. Turn end
+      if (ev.type === "turn_end") {
+        this.stats.turns++;
+      }
+
+      // 6. Agent ended (capture final assistant response & fallback token counting)
       if (ev.type === "agent_end" && Array.isArray(ev.messages)) {
+        if (this.stats.totalTokens === 0) {
+          for (const msg of ev.messages) {
+            if (msg.role === "assistant" && msg.usage) {
+              if (msg.model && !this.stats.model) this.stats.model = msg.model;
+              this.stats.tokensIn += msg.usage.input ?? 0;
+              this.stats.tokensOut += msg.usage.output ?? 0;
+              this.stats.cacheRead += msg.usage.cacheRead ?? 0;
+              this.stats.cacheWrite += msg.usage.cacheWrite ?? 0;
+              if (typeof msg.usage.cost?.total === "number") {
+                this.stats.cost = (this.stats.cost ?? 0) + msg.usage.cost.total;
+              }
+            }
+          }
+          this.stats.totalTokens = this.stats.tokensIn + this.stats.tokensOut + this.stats.cacheRead + this.stats.cacheWrite;
+        }
+
         const lastMsg = [...ev.messages]
           .reverse()
           .find((m: any) => m.role === "assistant" && Array.isArray(m.content));
@@ -89,6 +166,7 @@ export class SubagentEventParser {
           return {
             finalAssistantText: fullText,
             transcriptLine: fullText,
+            stats: this.getStats(),
           };
         }
       }
@@ -252,6 +330,24 @@ export class SubagentEventParser {
       priority: "high",
       lingerMs: 2500,
       transcriptLine,
+    };
+  }
+
+  getStats(): SubagentStats {
+    const inFlight = this.currentTurnUsage;
+    const inTokens = this.stats.tokensIn + (inFlight?.input ?? 0);
+    const outTokens = this.stats.tokensOut + (inFlight?.output ?? 0);
+    const cacheR = this.stats.cacheRead + (inFlight?.cacheRead ?? 0);
+    const cacheW = this.stats.cacheWrite + (inFlight?.cacheWrite ?? 0);
+    const cost = (this.stats.cost ?? 0) + (inFlight?.cost?.total ?? 0);
+    return {
+      ...this.stats,
+      tokensIn: inTokens,
+      tokensOut: outTokens,
+      cacheRead: cacheR,
+      cacheWrite: cacheW,
+      totalTokens: inTokens + outTokens + cacheR + cacheW,
+      cost: cost > 0 ? cost : this.stats.cost,
     };
   }
 }

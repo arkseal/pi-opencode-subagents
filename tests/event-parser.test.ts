@@ -194,4 +194,94 @@ describe("SubagentEventParser", () => {
     expect(parsed?.priority).toBe("low");
     expect(parsed?.transcriptLine).toContain("function solve()");
   });
+
+  it("accumulates tokens, tool calls, turns, and cost across subagent execution", () => {
+    const parser = new SubagentEventParser();
+
+    // 1. Tool execution start -> increments toolCalls
+    parser.parseLine(
+      JSON.stringify({
+        type: "tool_execution_start",
+        toolCallId: "call_1",
+        toolName: "read",
+        args: { path: "package.json" },
+      })
+    );
+    expect(parser.getStats().toolCalls).toBe(1);
+
+    // 2. Assistant message end with usage -> accumulates tokens and cost
+    parser.parseLine(
+      JSON.stringify({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          model: "gemini-3.8-flash",
+          usage: {
+            input: 1200,
+            output: 45,
+            cacheRead: 5000,
+            cacheWrite: 100,
+            cost: { total: 0.0025 },
+          },
+        },
+      })
+    );
+
+    // 3. Turn end -> increments turns
+    parser.parseLine(JSON.stringify({ type: "turn_end" }));
+
+    // 4. Second assistant message with usage
+    parser.parseLine(
+      JSON.stringify({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          model: "gemini-3.8-flash",
+          usage: {
+            input: 800,
+            output: 250,
+            cacheRead: 3000,
+            cacheWrite: 0,
+            cost: { total: 0.0015 },
+          },
+        },
+      })
+    );
+    parser.parseLine(JSON.stringify({ type: "turn_end" }));
+
+    const stats = parser.getStats();
+    expect(stats.tokensIn).toBe(2000);
+    expect(stats.tokensOut).toBe(295);
+    expect(stats.cacheRead).toBe(8000);
+    expect(stats.cacheWrite).toBe(100);
+    expect(stats.totalTokens).toBe(10395);
+    expect(stats.toolCalls).toBe(1);
+    expect(stats.turns).toBe(2);
+    expect(stats.cost).toBeCloseTo(0.004, 4);
+    expect(stats.model).toBe("gemini-3.8-flash");
+  });
+
+  it("extracts usage from agent_end fallback if individual message_ends omitted", () => {
+    const parser = new SubagentEventParser();
+
+    parser.parseLine(
+      JSON.stringify({
+        type: "agent_end",
+        messages: [
+          { role: "user", content: [{ type: "text", text: "hello" }] },
+          {
+            role: "assistant",
+            content: [{ type: "text", text: "hi" }],
+            usage: { input: 300, output: 20, cacheRead: 1500, cacheWrite: 0, cost: { total: 0.001 } },
+          },
+        ],
+      })
+    );
+
+    const stats = parser.getStats();
+    expect(stats.tokensIn).toBe(300);
+    expect(stats.tokensOut).toBe(20);
+    expect(stats.cacheRead).toBe(1500);
+    expect(stats.totalTokens).toBe(1820);
+  });
 });

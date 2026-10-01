@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { SubagentTracker } from "../src/tracker";
 
 describe("SubagentTracker", () => {
@@ -7,8 +10,12 @@ describe("SubagentTracker", () => {
   let capturedWidget: any = null;
   let capturedPlacement: any = null;
   let capturedStatus: any = null;
+  let testAgentDir: string;
 
   beforeEach(() => {
+    testAgentDir = mkdtempSync(join(tmpdir(), "subagents-test-"));
+    process.env.PI_CODING_AGENT_DIR = testAgentDir;
+
     tracker = new SubagentTracker();
     capturedWidget = null;
     capturedPlacement = null;
@@ -32,6 +39,12 @@ describe("SubagentTracker", () => {
     };
 
     tracker.setUIContext(mockCtx);
+  });
+
+  afterEach(() => {
+    try {
+      rmSync(testAgentDir, { recursive: true, force: true });
+    } catch {}
   });
 
   it("registers subagent start, mounts pinned widget below editor, and updates status indicator", () => {
@@ -142,5 +155,112 @@ describe("SubagentTracker", () => {
     active = tracker.getActiveList();
     // Must remain lingering on the tool completion!
     expect(active[0].currentLine).toBe('globbed "*.ts" (5 files found)');
+  });
+
+  it("stores and preserves stats when subagent finishes", () => {
+    tracker.registerStart({
+      id: "agent-stats",
+      task: "Stats task",
+      isolated: true,
+      logFile: "/tmp/agent-stats.log",
+    });
+
+    const stats = {
+      tokensIn: 500,
+      tokensOut: 100,
+      cacheRead: 2000,
+      cacheWrite: 0,
+      totalTokens: 2600,
+      cost: 0.005,
+      toolCalls: 3,
+      turns: 2,
+    };
+
+    tracker.registerFinish("agent-stats", {
+      status: "completed",
+      durationMs: 2500,
+      stats,
+    });
+
+    const recent = tracker.getRecentList();
+    expect(recent[0].stats).toBeDefined();
+    expect(recent[0].stats?.totalTokens).toBe(2600);
+    expect(recent[0].stats?.toolCalls).toBe(3);
+  });
+
+  it("allows toggling sidebar panel enabled state", () => {
+    expect(tracker.isSidebarEnabled()).toBe(true);
+
+    tracker.setSidebarEnabled(false);
+    expect(tracker.isSidebarEnabled()).toBe(false);
+
+    tracker.setSidebarEnabled(true);
+    expect(tracker.isSidebarEnabled()).toBe(true);
+  });
+
+  it("renders completed subagents in sidebar panel with green status", () => {
+    let capturedPanel: any = null;
+    (globalThis as any).__PI_SIDEBAR_TUI__ = {
+      registerPanel: (panel: any) => {
+        capturedPanel = panel;
+        return () => {};
+      },
+      unregisterPanel: () => {},
+      fg: (color: string, str: string) => `[${color}]${str}[/${color}]`,
+      bold: (str: string) => `*${str}*`,
+      dim: (str: string) => `~${str}~`,
+    };
+
+    tracker.registerStart({
+      id: "agent-green",
+      task: "Check green color",
+      isolated: true,
+      logFile: "/tmp/green.log",
+    });
+
+    // Subagent completes
+    const tracked = tracker.getActiveList()[0];
+    tracked.status = "completed";
+    tracked.endTime = Date.now();
+
+    expect(capturedPanel).not.toBeNull();
+    const rendered = capturedPanel.render({ spinnerFrame: 0 }, 80);
+    const joined = rendered.join("\n");
+
+    // Completed subagents must display green bullet [success]●[/success] and done time in green!
+    expect(joined).toContain("[success]●[/success]");
+    expect(joined).toContain("[success]done in");
+
+    delete (globalThis as any).__PI_SIDEBAR_TUI__;
+  });
+
+  it("supports 3-way toggle between input-only, sidebar-only, and both", () => {
+    // Mode 1: input-only (only above text input)
+    tracker.setDisplayMode("input");
+    expect(tracker.getDisplayMode()).toBe("input");
+    expect(tracker.isWidgetEnabled()).toBe(true);
+    expect(tracker.isSidebarEnabled()).toBe(false);
+
+    // Mode 2: sidebar-only (only sidebar)
+    tracker.setDisplayMode("sidebar");
+    expect(tracker.getDisplayMode()).toBe("sidebar");
+    expect(tracker.isWidgetEnabled()).toBe(false);
+    expect(tracker.isSidebarEnabled()).toBe(true);
+
+    // Mode 3: both (above text input & sidebar)
+    tracker.setDisplayMode("both");
+    expect(tracker.getDisplayMode()).toBe("both");
+    expect(tracker.isWidgetEnabled()).toBe(true);
+    expect(tracker.isSidebarEnabled()).toBe(true);
+
+    // Cycle through modes: both -> input -> sidebar -> both
+    const cycled1 = tracker.cycleDisplayMode();
+    expect(cycled1).toBe("input");
+
+    const cycled2 = tracker.cycleDisplayMode();
+    expect(cycled2).toBe("sidebar");
+
+    const cycled3 = tracker.cycleDisplayMode();
+    expect(cycled3).toBe("both");
   });
 });

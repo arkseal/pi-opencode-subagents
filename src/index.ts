@@ -1,19 +1,26 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { executeSubagent } from "./runner.js";
-import { renderSubagentCall, renderSubagentResult, cleanSubagentOutput } from "./subagent-ui.js";
+import { renderSubagentCall, renderSubagentResult, cleanSubagentOutput, buildSubagentStatsSummary, renderSubagentStatsMessage } from "./subagent-ui.js";
 import { globalSubagentTracker } from "./tracker.js";
 import { SubagentViewer } from "./subagent-viewer.js";
+import { loadSubagentSettings, saveSubagentSettings, type SubagentSettings, type SubagentDisplayMode } from "./config.js";
 
 export { executeSubagent } from "./runner.js";
 export { createWorktree, cleanupWorktree } from "./worktree.js";
 export { formatTaskResultEnvelope } from "./envelope.js";
 export { checkSubagentDepth, setMaxDepth } from "./depth-guard.js";
-export { renderSubagentCall, renderSubagentResult, cleanSubagentOutput } from "./subagent-ui.js";
+export { renderSubagentCall, renderSubagentResult, cleanSubagentOutput, buildSubagentStatsSummary, renderSubagentStatsMessage } from "./subagent-ui.js";
 export { globalSubagentTracker, SubagentTracker } from "./tracker.js";
 export { SubagentViewer } from "./subagent-viewer.js";
+export { loadSubagentSettings, saveSubagentSettings, type SubagentSettings, type SubagentDisplayMode } from "./config.js";
 
 export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
+  // Register custom message renderer for subagent stats in main chat
+  if (typeof (pi as any).registerMessageRenderer === "function") {
+    (pi as any).registerMessageRenderer("subagent-stats", renderSubagentStatsMessage);
+  }
+
   // Capture UI context and restore subagents on session lifecycle
   pi.on("session_start", async (_event, ctx) => {
     globalSubagentTracker.setUIContext(ctx);
@@ -35,11 +42,53 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
     } catch {}
   });
 
-  // Register /subagents inspection command
+  function formatDisplayModeNotification(mode: SubagentDisplayMode): string {
+    switch (mode) {
+      case "input":
+        return "Subagent display: 1. only above text input";
+      case "sidebar":
+        return "Subagent display: 2. only sidebar";
+      case "both":
+        return "Subagent display: 3. both (above text input & sidebar)";
+    }
+  }
+
+  function handleDisplayToggle(args: string | undefined, ctx: any) {
+    const arg = args?.trim().toLowerCase();
+    let mode: SubagentDisplayMode;
+    if (arg === "input" || arg === "1") mode = "input";
+    else if (arg === "sidebar" || arg === "2") mode = "sidebar";
+    else if (arg === "both" || arg === "3") mode = "both";
+    else {
+      mode = globalSubagentTracker.cycleDisplayMode();
+      ctx.ui.notify(formatDisplayModeNotification(mode), "info");
+      return;
+    }
+    globalSubagentTracker.setDisplayMode(mode);
+    ctx.ui.notify(formatDisplayModeNotification(mode), "info");
+  }
+
+  // Register /subagents inspection and toggle command
   pi.registerCommand("subagents", {
-    description: "Peer into what subagents are currently working on or review past logs",
+    description: "Peer into subagents or toggle UI display: /subagents [id] | toggle [input|sidebar|both]",
     handler: async (args, ctx) => {
       globalSubagentTracker.setUIContext(ctx);
+      const trimmedArg = args?.trim();
+
+      // Subcommand: 3-way display toggle (1. only above input | 2. only sidebar | 3. both)
+      if (trimmedArg && (
+        trimmedArg === "toggle" ||
+        trimmedArg.startsWith("toggle ") ||
+        trimmedArg === "sidebar" ||
+        trimmedArg.startsWith("sidebar ") ||
+        trimmedArg === "display" ||
+        trimmedArg.startsWith("display ")
+      )) {
+        const parts = trimmedArg.split(/\s+/);
+        handleDisplayToggle(parts.slice(1).join(" "), ctx);
+        return;
+      }
+
       const active = globalSubagentTracker.getActiveList();
       const recent = globalSubagentTracker.getRecentList();
       const all = [...active, ...recent];
@@ -63,7 +112,6 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
       // Determine target subagent
       let target: typeof all[0] | undefined;
 
-      const trimmedArg = args?.trim();
       if (trimmedArg) {
         target = all.find((s) => s.id === trimmedArg || s.id.includes(trimmedArg));
       }
@@ -102,6 +150,17 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
         });
       });
     },
+  });
+
+  // 3-way toggle command for subagent display: 1. only above input | 2. only sidebar | 3. both
+  pi.registerCommand("subagents-toggle", {
+    description: "3-way toggle subagent display: 1. only above text input | 2. only sidebar | 3. both",
+    handler: async (args, ctx) => handleDisplayToggle(args, ctx),
+  });
+
+  pi.registerCommand("subagents-sidebar", {
+    description: "3-way toggle subagent display: 1. only above text input | 2. only sidebar | 3. both",
+    handler: async (args, ctx) => handleDisplayToggle(args, ctx),
   });
 
   pi.registerTool({
@@ -147,6 +206,17 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
         onUpdate,
       });
 
+      const cumulative = globalSubagentTracker.getCumulativeStats();
+      result.details.cumulativeStats = cumulative;
+
+      if (pi.events && result.details?.stats) {
+        pi.events.emit("subagent:stats", {
+          id: result.details.id,
+          stats: result.details.stats,
+          cumulative,
+        });
+      }
+
       // Persist subagent metadata to session JSONL so it survives session exit and rejoin
       try {
         if (ctx.sessionManager && typeof ctx.sessionManager.appendCustomEntry === "function") {
@@ -162,6 +232,7 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
             logFile: result.details.logFile,
             exitCode: result.details.exitCode,
             currentLine: "Done",
+            stats: result.details.stats,
           });
         }
       } catch {}

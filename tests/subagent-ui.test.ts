@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { cleanSubagentOutput, renderSubagentCall, renderSubagentResult } from "../src/subagent-ui";
+import { cleanSubagentOutput, renderSubagentCall, renderSubagentResult, buildSubagentStatsSummary, formatSubagentStats } from "../src/subagent-ui";
 
 // Mock theme object matching Pi's theme interface
 const mockTheme = {
@@ -143,5 +143,125 @@ describe("renderSubagentResult", () => {
     const rendered = component.render(80).join("\n");
     expect(rendered).toContain("▲");
     expect(rendered).toContain("Subagent failed (exit 1)");
+  });
+
+  it("renders subagent stats badge in main chat result", () => {
+    const component = renderSubagentResult(
+      {
+        content: [{ type: "text", text: "Task completed successfully" }],
+        details: {
+          id: "subagent_stats_1",
+          status: "completed",
+          durationMs: 2500,
+          summary: "Task completed successfully",
+          stats: {
+            tokensIn: 3450,
+            tokensOut: 120,
+            cacheRead: 8500,
+            cacheWrite: 0,
+            totalTokens: 12070,
+            cost: 0.003,
+            toolCalls: 4,
+            turns: 2,
+          },
+        },
+      },
+      { expanded: false, isPartial: false },
+      mockTheme,
+      {}
+    );
+
+    const rendered = component.render(100).join("\n");
+    expect(rendered).toContain("3.5k"); // tokens in
+    expect(rendered).toContain("in");
+    expect(rendered).toContain("120");  // tokens out
+    expect(rendered).toContain("out");
+    expect(rendered).toContain("8.5k"); // cache read
+    expect(rendered).toContain("cache");
+    expect(rendered).toContain("tools");
+  });
+
+  it("renders detailed token breakdown in expanded view", () => {
+    const component = renderSubagentResult(
+      {
+        content: [{ type: "text", text: "Task completed" }],
+        details: {
+          id: "subagent_stats_exp",
+          status: "completed",
+          durationMs: 3000,
+          summary: "Task completed",
+          stats: {
+            tokensIn: 10500,
+            tokensOut: 650,
+            cacheRead: 25000,
+            cacheWrite: 0,
+            totalTokens: 36150,
+            cost: 0.015,
+            toolCalls: 5,
+            turns: 3,
+          },
+        },
+      },
+      { expanded: true, isPartial: false },
+      mockTheme,
+      {}
+    );
+
+    const rendered = component.render(100).join("\n");
+    expect(rendered).toContain("Tokens:");
+    expect(rendered).toContain("10,500 in");
+    expect(rendered).toContain("650 out");
+    expect(rendered).toContain("25,000 cache read");
+    expect(rendered).toContain("36,150 total");
+    expect(rendered).toContain("5 tool calls");
+    expect(rendered).toContain("3 turns");
+  });
+
+  it("buildSubagentStatsSummary aggregates stats across all subagents", () => {
+    const items = [
+      {
+        id: "subagent_1",
+        task: "First task",
+        status: "completed" as const,
+        startTime: Date.now() - 4000,
+        durationMs: 4000,
+        stats: {
+          tokensIn: 2000,
+          tokensOut: 100,
+          cacheRead: 5000,
+          cacheWrite: 0,
+          totalTokens: 7100,
+          cost: 0.002,
+          toolCalls: 2,
+          turns: 2,
+        },
+      },
+      {
+        id: "subagent_2",
+        task: "Second task",
+        status: "completed" as const,
+        startTime: Date.now() - 6000,
+        durationMs: 6000,
+        stats: {
+          tokensIn: 5000,
+          tokensOut: 300,
+          cacheRead: 10000,
+          cacheWrite: 0,
+          totalTokens: 15300,
+          cost: 0.005,
+          toolCalls: 4,
+          turns: 3,
+        },
+      },
+    ];
+
+    const summary = buildSubagentStatsSummary(items);
+    expect(summary.text).toContain("Subagent Stats Summary");
+    expect(summary.text).toContain("Total: 2 subagents");
+    expect(summary.details.totalTokens).toBe(22400);
+    expect(summary.details.totalIn).toBe(7000);
+    expect(summary.details.totalOut).toBe(400);
+    expect(summary.details.totalCache).toBe(15000);
+    expect(summary.details.totalToolCalls).toBe(6);
   });
 });
