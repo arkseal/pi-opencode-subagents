@@ -66,6 +66,22 @@ describe("SubagentTracker", () => {
     expect(capturedStatus).toContain("1 subagent active");
   });
 
+  it("registers subagent start with custom model and reasoning", () => {
+    tracker.registerStart({
+      id: "agent-custom",
+      task: "Optimize query plan",
+      model: "openai/gpt-4o",
+      reasoning: "high",
+      isolated: true,
+      logFile: "/tmp/agent-custom.log",
+    });
+
+    const active = tracker.getActiveList();
+    expect(active.length).toBe(1);
+    expect(active[0].model).toBe("openai/gpt-4o");
+    expect(active[0].reasoning).toBe("high");
+  });
+
   it("updates live peek line as progress arrives", () => {
     tracker.registerStart({
       id: "agent-1",

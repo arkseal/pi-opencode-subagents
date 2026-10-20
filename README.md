@@ -37,6 +37,44 @@ Context-isolated subagent delegation with Git worktree isolation and bounded res
 
 *(Stats automatically aggregate into the main chat result cards and the sidebar tokens panel; manual commands are no longer needed.)*
 
+## Subagent Tool Parameters
+
+The `subagent` tool supports the following parameters:
+
+- `task` (required, `string`): Task description for the subagent to perform autonomously.
+- `description` (optional, `string`): Short 3-5 word summary/title of the task for the UI header.
+- `isolated` (optional, `boolean`, default `true`): Run in an isolated Git worktree. Keeps working tree clean from experimental edits.
+- `model` (optional, `string`): Model pattern or ID to use for the subagent (e.g. `'openai/gpt-4o'`, `'anthropic/claude-3-7-sonnet'`, or with thinking shorthand like `'claude-3-7-sonnet:high'`).
+- `reasoning` (optional, `string`): Reasoning effort or thinking level for the subagent (`'off'`, `'minimal'`, `'low'`, `'medium'`, `'high'`, `'xhigh'`, `'max'`).
+- `thinking` (optional, `string`): Alias for `reasoning`.
+
+### Examples
+
+**Delegate to a different model:**
+```json
+{
+  "task": "Scan codebase for dead dependencies and list them",
+  "model": "gemini-3.8-flash"
+}
+```
+
+**Delegate complex reasoning task with thinking level:**
+```json
+{
+  "task": "Find and fix concurrency deadlock in connection pool",
+  "model": "anthropic/claude-3-7-sonnet",
+  "reasoning": "high"
+}
+```
+
+**Using model thinking shorthand:**
+```json
+{
+  "task": "Prove correctness of cache invalidation logic",
+  "model": "claude-sonnet:high"
+}
+```
+
 ## Running Tests
 
 ```bash

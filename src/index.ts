@@ -1,12 +1,12 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { executeSubagent } from "./runner.js";
+import { executeSubagent, buildPiArgs, type SubagentModelOption } from "./runner.js";
 import { renderSubagentCall, renderSubagentResult, cleanSubagentOutput, buildSubagentStatsSummary, renderSubagentStatsMessage } from "./subagent-ui.js";
 import { globalSubagentTracker } from "./tracker.js";
 import { SubagentViewer } from "./subagent-viewer.js";
 import { loadSubagentSettings, saveSubagentSettings, type SubagentSettings, type SubagentDisplayMode } from "./config.js";
 
-export { executeSubagent } from "./runner.js";
+export { executeSubagent, buildPiArgs, type SubagentModelOption } from "./runner.js";
 export { createWorktree, cleanupWorktree } from "./worktree.js";
 export { formatTaskResultEnvelope } from "./envelope.js";
 export { checkSubagentDepth, setMaxDepth } from "./depth-guard.js";
@@ -171,6 +171,7 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
     promptSnippet: "Delegate tasks to isolated subagents (supports parallel calls)",
     promptGuidelines: [
       "Dispatch multiple subagent calls in parallel within a single turn for independent tasks.",
+      "Optionally configure a specific model or reasoning effort for subagents depending on task complexity.",
     ],
     parameters: Type.Object(
       {
@@ -188,6 +189,24 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
               "Run in an isolated Git worktree (default true). Keeps working tree clean from experimental edits.",
           })
         ),
+        model: Type.Optional(
+          Type.String({
+            description:
+              "Optional model to use for the subagent (e.g. 'openai/gpt-4o', 'claude-sonnet', or 'claude-sonnet:high'). Supports ':thinking' suffix to set reasoning.",
+          })
+        ),
+        reasoning: Type.Optional(
+          Type.String({
+            description:
+              "Optional reasoning effort or thinking level for the subagent (e.g. 'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max').",
+          })
+        ),
+        thinking: Type.Optional(
+          Type.String({
+            description:
+              "Alias for reasoning. Set thinking level for the subagent (e.g. 'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max').",
+          })
+        ),
       },
       { additionalProperties: false }
     ),
@@ -201,6 +220,9 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
         description: params.description,
         cwd: ctx.cwd,
         isolated: params.isolated ?? true,
+        model: params.model,
+        reasoning: params.reasoning ?? params.thinking,
+        thinking: params.thinking,
         currentDepth: depth,
         signal,
         onUpdate,
@@ -224,6 +246,8 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
             id: result.details.id,
             task: result.details.task,
             description: result.details.description,
+            model: result.details.model,
+            reasoning: result.details.reasoning,
             startTime: Date.now() - (result.details.durationMs ?? 0),
             endTime: Date.now(),
             durationMs: result.details.durationMs,

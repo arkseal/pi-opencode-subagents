@@ -54,6 +54,39 @@ describe("renderSubagentCall", () => {
     expect(rendered).toContain("Fix Typos");
     expect(rendered).toContain("[shared]");
   });
+
+  it("renders model badge in tool call header when model is provided", () => {
+    const component = renderSubagentCall(
+      { task: "Review PR", model: "openai/gpt-4o" },
+      mockTheme,
+      { isPartial: false }
+    );
+
+    const rendered = component.render(80).join("\n");
+    expect(rendered).toContain("[openai/gpt-4o]");
+  });
+
+  it("renders model and reasoning badge when both model and reasoning are provided", () => {
+    const component = renderSubagentCall(
+      { task: "Math proof", model: "anthropic/claude-3-7-sonnet", reasoning: "high" },
+      mockTheme,
+      { isPartial: false }
+    );
+
+    const rendered = component.render(80).join("\n");
+    expect(rendered).toContain("[anthropic/claude-3-7-sonnet:high]");
+  });
+
+  it("renders reasoning badge when only reasoning/thinking is provided", () => {
+    const component = renderSubagentCall(
+      { task: "Deep analysis", reasoning: "max" },
+      mockTheme,
+      { isPartial: false }
+    );
+
+    const rendered = component.render(80).join("\n");
+    expect(rendered).toContain("[reasoning:max]");
+  });
 });
 
 describe("renderSubagentResult", () => {
@@ -120,6 +153,30 @@ describe("renderSubagentResult", () => {
     expect(rendered).toContain("/tmp/pi-subagents/subagent_xyz.log");
     expect(rendered).toContain("Worktree:");
     expect(rendered).toContain("subagent/branch-1");
+  });
+
+  it("renders model and reasoning in expanded view when provided", () => {
+    const component = renderSubagentResult(
+      {
+        content: [{ type: "text", text: "Done" }],
+        details: {
+          id: "subagent_model_exp",
+          status: "completed",
+          durationMs: 1200,
+          model: "gemini-3.8-flash",
+          reasoning: "high",
+          summary: "Done",
+        },
+      },
+      { expanded: true, isPartial: false },
+      mockTheme,
+      {}
+    );
+
+    const rendered = component.render(120).join("\n");
+    expect(rendered).toContain("Model:");
+    expect(rendered).toContain("gemini-3.8-flash");
+    expect(rendered).toContain("(high reasoning)");
   });
 
   it("renders failure view when subagent errors", () => {

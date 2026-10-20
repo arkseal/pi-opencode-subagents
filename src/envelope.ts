@@ -6,6 +6,8 @@ export interface TaskResultOptions {
   durationMs: number;
   summary: string;
   logFilePath?: string;
+  model?: string;
+  reasoning?: string;
   stats?: SubagentStats;
 }
 
@@ -24,6 +26,16 @@ export function formatTaskResultEnvelope(opts: TaskResultOptions): string {
   const durationSec = (opts.durationMs / 1000).toFixed(1);
   const boundedSummary = truncateToBudget(opts.summary, 2000);
 
+  let modelAttr = "";
+  const effectiveModel = opts.model || opts.stats?.model;
+  if (effectiveModel) {
+    modelAttr += ` model="${effectiveModel}"`;
+  }
+  const effectiveReasoning = opts.reasoning || opts.stats?.thinkingLevel;
+  if (effectiveReasoning) {
+    modelAttr += ` reasoning="${effectiveReasoning}"`;
+  }
+
   let statsAttr = "";
   if (opts.stats && (opts.stats.totalTokens > 0 || opts.stats.toolCalls > 0)) {
     statsAttr = ` tokens_in="${opts.stats.tokensIn}" tokens_out="${opts.stats.tokensOut}" cache_read="${opts.stats.cacheRead}"`;
@@ -32,7 +44,7 @@ export function formatTaskResultEnvelope(opts: TaskResultOptions): string {
   }
 
   const lines = [
-    `<task-result id="${opts.id}" status="${opts.status}" duration="${durationSec}s"${statsAttr}>`,
+    `<task-result id="${opts.id}" status="${opts.status}" duration="${durationSec}s"${modelAttr}${statsAttr}>`,
     boundedSummary,
   ];
 

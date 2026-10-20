@@ -79,6 +79,15 @@ export function renderSubagentCall(args: any, theme: any, context: any) {
     content += " " + theme.fg("dim", "[isolated]");
   }
 
+  if (args?.model) {
+    const reasoningSuffix = (args?.reasoning || args?.thinking) && !args.model.includes(":")
+      ? `:${args.reasoning ?? args.thinking}`
+      : "";
+    content += " " + theme.fg("dim", `[${args.model}${reasoningSuffix}]`);
+  } else if (args?.reasoning || args?.thinking) {
+    content += " " + theme.fg("dim", `[reasoning:${args.reasoning ?? args.thinking}]`);
+  }
+
   if (context.isPartial) {
     const elapsed = context.state?.elapsedMs
       ? ` (${(context.state.elapsedMs / 1000).toFixed(1)}s)`
@@ -175,6 +184,15 @@ export function renderSubagentResult(
     // Expanded View (full transcript and worktree details)
     outputText += "\n" + theme.fg("dim", "─".repeat(50));
 
+    const effectiveModel = details.model || details.stats?.model;
+    const effectiveReasoning = details.reasoning || details.stats?.thinkingLevel;
+    if (effectiveModel) {
+      const reasoningSuffix = effectiveReasoning ? ` (${effectiveReasoning} reasoning)` : "";
+      outputText += `\n${theme.fg("muted", "Model:")} ${theme.fg("accent", effectiveModel)}${theme.fg("dim", reasoningSuffix)}`;
+    } else if (effectiveReasoning) {
+      outputText += `\n${theme.fg("muted", "Reasoning:")} ${theme.fg("dim", effectiveReasoning)}`;
+    }
+
     if (details.stats && (details.stats.totalTokens > 0 || details.stats.toolCalls > 0)) {
       const s = details.stats;
       const formattedParts = [
@@ -261,10 +279,10 @@ export function buildSubagentStatsSummary(items: any[]): { text: string; details
       const tokStr = `${formatTokens(st.tokensIn)} in · ${formatTokens(st.tokensOut)} out${st.cacheRead > 0 ? ` · ${formatTokens(st.cacheRead)} cache` : ""}`;
       const toolStr = st.toolCalls > 0 ? ` · ${st.toolCalls} ${st.toolCalls === 1 ? "tool" : "tools"}` : "";
       const costStr = st.cost && st.cost > 0 ? ` · $${st.cost.toFixed(3)}` : "";
-      lines.push(`• [${s.id}] "${title}" (${s.status}, ${durSec}s)`);
+      lines.push(`• [${s.id}] "${title}" (${s.status}, ${durSec}s)${s.model ? ` [${s.model}]` : ""}`);
       lines.push(`  ↳ ${tokStr}${toolStr}${costStr}`);
     } else {
-      lines.push(`• [${s.id}] "${title}" (${s.status}, ${durSec}s)`);
+      lines.push(`• [${s.id}] "${title}" (${s.status}, ${durSec}s)${s.model ? ` [${s.model}]` : ""}`);
     }
   }
 

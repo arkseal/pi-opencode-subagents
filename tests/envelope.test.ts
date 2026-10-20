@@ -49,4 +49,41 @@ describe("Subagent Task Result Envelope", () => {
     expect(envelope).toContain('tool_calls="3"');
     expect(envelope).toContain("Stats: 4.5k in · 320 out · 12.0k cache · 3 tools · $0.008");
   });
+
+  it("includes model and reasoning attributes when specified", () => {
+    const envelope = formatTaskResultEnvelope({
+      id: "agent-model-env",
+      status: "completed",
+      durationMs: 2100,
+      summary: "Completed with specific model",
+      model: "anthropic/claude-3-7-sonnet",
+      reasoning: "high",
+    });
+
+    expect(envelope).toContain('model="anthropic/claude-3-7-sonnet"');
+    expect(envelope).toContain('reasoning="high"');
+  });
+
+  it("extracts model and reasoning attributes from stats if not directly in options", () => {
+    const envelope = formatTaskResultEnvelope({
+      id: "agent-stats-model-env",
+      status: "completed",
+      durationMs: 1500,
+      summary: "Completed with stats model",
+      stats: {
+        tokensIn: 100,
+        tokensOut: 50,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 150,
+        turns: 1,
+        toolCalls: 0,
+        model: "openai/gpt-4o",
+        thinkingLevel: "medium",
+      },
+    });
+
+    expect(envelope).toContain('model="openai/gpt-4o"');
+    expect(envelope).toContain('reasoning="medium"');
+  });
 });

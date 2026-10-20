@@ -9,6 +9,8 @@ export interface TrackedSubagent {
   id: string;
   task: string;
   description?: string;
+  model?: string;
+  reasoning?: string;
   startTime: number;
   endTime?: number;
   durationMs?: number;
@@ -63,7 +65,8 @@ class PinnedSubagentsWidget implements Component {
       if (s.status === "running") {
         const icon = spinner;
         const mode = s.isolated ? this.theme.fg("dim", "[isolated]") : this.theme.fg("warning", "[shared]");
-        const mainLine = `  ${icon} ${this.theme.fg("accent", `[${s.id}]`)} ${this.theme.bold(`"${title}"`)} · ${this.theme.fg("dim", `${elapsedSec}s`)} ${mode}`;
+        const modelBadge = s.model ? ` ${this.theme.fg("dim", `[${s.model}]`)}` : (s.reasoning ? ` ${this.theme.fg("dim", `[reasoning:${s.reasoning}]`)}` : "");
+        const mainLine = `  ${icon} ${this.theme.fg("accent", `[${s.id}]`)} ${this.theme.bold(`"${title}"`)} · ${this.theme.fg("dim", `${elapsedSec}s`)} ${mode}${modelBadge}`;
         
         const truncated = truncateToWidth(mainLine, innerContentWidth);
         const padSpaces = Math.max(0, innerContentWidth - visibleWidth(truncated));
@@ -188,6 +191,8 @@ export class SubagentTracker {
     id: string;
     task: string;
     description?: string;
+    model?: string;
+    reasoning?: string;
     isolated: boolean;
     logFile: string;
   }) {
@@ -200,6 +205,8 @@ export class SubagentTracker {
       id: subagent.id,
       task: subagent.task,
       description: subagent.description,
+      model: subagent.model,
+      reasoning: subagent.reasoning,
       startTime: Date.now(),
       status: "running",
       isolated: subagent.isolated,

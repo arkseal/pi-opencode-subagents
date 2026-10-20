@@ -26,12 +26,42 @@ function getSubagentDir(): string {
   }
 }
 
+export type SubagentModelOption =
+  | string
+  | {
+      name?: string;
+      model?: string;
+      reasoning?: string;
+      thinking?: string;
+    };
+
+export function buildPiArgs(options: {
+  task: string;
+  model?: string;
+  reasoning?: string;
+  thinking?: string;
+}): string[] {
+  const args = ["--mode", "json", "-p", "--no-session"];
+  if (options.model) {
+    args.push("--model", options.model);
+  }
+  const thinking = options.reasoning ?? options.thinking;
+  if (thinking) {
+    args.push("--thinking", thinking);
+  }
+  args.push("-a", options.task);
+  return args;
+}
+
 export interface SpawnSubagentOptions {
   task: string;
   description?: string;
   cwd: string;
   isolated?: boolean; // defaults to true
   currentDepth?: number; // defaults to 0
+  model?: SubagentModelOption;
+  reasoning?: string;
+  thinking?: string;
   onUpdate?: (update: { content: Array<{ type: "text"; text: string }>; details: any }) => void;
   signal?: AbortSignal;
 }
@@ -43,6 +73,16 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
   const id = `subagent_${randomUUID().slice(0, 8)}`;
   const logFile = path.join(subagentDir, `${id}.log`);
   const startTime = Date.now();
+
+  let modelName: string | undefined;
+  let modelReasoning: string | undefined;
+  if (typeof options.model === "string") {
+    modelName = options.model;
+  } else if (typeof options.model === "object" && options.model !== null) {
+    modelName = options.model.name || options.model.model;
+    modelReasoning = options.model.reasoning || options.model.thinking;
+  }
+  const thinking = options.reasoning ?? options.thinking ?? modelReasoning;
 
   const isolated = options.isolated ?? true;
   let workDir = options.cwd;
@@ -62,6 +102,8 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
     id,
     task: options.task,
     description: options.description,
+    model: modelName,
+    reasoning: thinking,
     isolated,
     logFile,
   });
@@ -72,9 +114,15 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
   let lastAssistantText = "";
   const parser = new SubagentEventParser();
 
+  const piArgs = buildPiArgs({
+    task: options.task,
+    model: modelName,
+    reasoning: thinking,
+  });
+
   const child = spawn(
     "pi",
-    ["--mode", "json", "-p", "--no-session", "-a", options.task],
+    piArgs,
     {
       cwd: workDir,
       env: {
@@ -139,6 +187,8 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
         id,
         task: options.task,
         description: options.description,
+        model: modelName,
+        reasoning: thinking,
         status: "running",
         elapsedMs: Date.now() - startTime,
         currentLine: lastLine,
@@ -199,6 +249,8 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
     durationMs,
     summary,
     logFilePath: logFile,
+    model: modelName,
+    reasoning: thinking,
     stats,
   });
 
@@ -208,6 +260,8 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
       id,
       task: options.task,
       description: options.description,
+      model: modelName,
+      reasoning: thinking,
       status,
       exitCode,
       durationMs,

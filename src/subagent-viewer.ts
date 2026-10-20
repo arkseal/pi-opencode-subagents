@@ -205,7 +205,14 @@ export class SubagentViewer implements Component {
         ? spinner
         : this.theme.fg("error", "▲");
 
-    const statusText = ` ${statusIcon} Status: ${status} (${elapsedSec}) · Log: ${this.logPath} `;
+    const effectiveModel = sub?.model || sub?.stats?.model;
+    const effectiveReasoning = sub?.reasoning || sub?.stats?.thinkingLevel;
+    const modelText = effectiveModel
+      ? ` · Model: ${effectiveModel}${effectiveReasoning ? ` (${effectiveReasoning})` : ""}`
+      : effectiveReasoning
+      ? ` · Reasoning: ${effectiveReasoning}`
+      : "";
+    const statusText = ` ${statusIcon} Status: ${status} (${elapsedSec})${modelText} · Log: ${this.logPath} `;
     const padStatus = Math.max(0, innerWidth - visibleWidth(statusText));
     output.push(
       `${this.theme.fg("toolTitle", "│")}${this.theme.fg("dim", statusText)}${" ".repeat(padStatus)}${this.theme.fg("toolTitle", "│")}`
