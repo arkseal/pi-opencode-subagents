@@ -1,29 +1,78 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { executeSubagent } from "./runner.js";
-import { renderSubagentCall, renderSubagentResult, cleanSubagentOutput, buildSubagentStatsSummary, renderSubagentStatsMessage } from "./subagent-ui.js";
-import { globalSubagentTracker } from "./tracker.js";
+import { executeSubagent, getSubagentDir, getSubagentSessionsDir, stopSubagent, stopAllSubagents } from "./runner.js";
+import {
+  renderSubagentCall,
+  renderSubagentResult,
+  cleanSubagentOutput,
+  buildSubagentStatsSummary,
+  renderSubagentStatsMessage,
+  renderSubagentResponseMessage,
+} from "./subagent-ui.js";
+import { globalSubagentTracker, SubagentTracker } from "./tracker.js";
 import { SubagentViewer } from "./subagent-viewer.js";
-import { loadSubagentSettings, saveSubagentSettings, type SubagentSettings, type SubagentDisplayMode } from "./config.js";
+import {
+  loadSubagentSettings,
+  saveSubagentSettings,
+  type SubagentSettings,
+  type SubagentDisplayMode,
+} from "./config.js";
+import { formatSubagentEnvelope } from "./envelope.js";
+import {
+  discoverAgents,
+  resolveAgent,
+  formatAvailableAgentsDescription,
+  BUILTIN_AGENTS,
+  type AgentProfile,
+} from "./agents.js";
 
-export { executeSubagent } from "./runner.js";
+export { executeSubagent, getSubagentDir, getSubagentSessionsDir, stopSubagent, stopAllSubagents } from "./runner.js";
 export { createWorktree, cleanupWorktree } from "./worktree.js";
-export { formatTaskResultEnvelope } from "./envelope.js";
+export { formatTaskResultEnvelope, formatSubagentEnvelope } from "./envelope.js";
 export { checkSubagentDepth, setMaxDepth } from "./depth-guard.js";
-export { renderSubagentCall, renderSubagentResult, cleanSubagentOutput, buildSubagentStatsSummary, renderSubagentStatsMessage } from "./subagent-ui.js";
+export {
+  renderSubagentCall,
+  renderSubagentResult,
+  cleanSubagentOutput,
+  buildSubagentStatsSummary,
+  renderSubagentStatsMessage,
+} from "./subagent-ui.js";
 export { globalSubagentTracker, SubagentTracker } from "./tracker.js";
 export { SubagentViewer } from "./subagent-viewer.js";
 export { loadSubagentSettings, saveSubagentSettings, type SubagentSettings, type SubagentDisplayMode } from "./config.js";
+export {
+  discoverAgents,
+  resolveAgent,
+  formatAvailableAgentsDescription,
+  BUILTIN_AGENTS,
+  type AgentProfile,
+} from "./agents.js";
 
 export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
-  // Register custom message renderer for subagent stats in main chat
+  // Register custom message renderers for subagent stats & responses in main chat
   if (typeof (pi as any).registerMessageRenderer === "function") {
     (pi as any).registerMessageRenderer("subagent-stats", renderSubagentStatsMessage);
+    (pi as any).registerMessageRenderer("subagent-response", renderSubagentResponseMessage);
   }
+
+  let discoveredAgents: AgentProfile[] = [...BUILTIN_AGENTS];
+  let isAgentActive = false;
+
+  pi.on("agent_start", () => {
+    isAgentActive = true;
+  });
+
+  pi.on("agent_end", () => {
+    isAgentActive = false;
+  });
 
   // Capture UI context and restore subagents on session lifecycle
   pi.on("session_start", async (_event, ctx) => {
     globalSubagentTracker.setUIContext(ctx);
+
+    try {
+      discoveredAgents = await discoverAgents(ctx.cwd);
+    } catch {}
 
     // Restore saved subagents from session JSONL history
     try {
@@ -75,15 +124,33 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
       globalSubagentTracker.setUIContext(ctx);
       const trimmedArg = args?.trim();
 
+      // Subcommand: stop / cancel all running subagents
+      if (trimmedArg === "stop" || trimmedArg === "cancel" || trimmedArg === "kill") {
+        const stopped = stopAllSubagents();
+        ctx.ui.notify(stopped > 0 ? `Stopped ${stopped} running subagent(s).` : "No running subagents to stop.", "info");
+        return;
+      }
+
       // Subcommand: 3-way display toggle (1. only above input | 2. only sidebar | 3. both)
-      if (trimmedArg && (
-        trimmedArg === "toggle" ||
-        trimmedArg.startsWith("toggle ") ||
-        trimmedArg === "sidebar" ||
-        trimmedArg.startsWith("sidebar ") ||
-        trimmedArg === "display" ||
-        trimmedArg.startsWith("display ")
-      )) {
+      if (trimmedArg === "more" || trimmedArg === "expand") {
+        const showAll = globalSubagentTracker.toggleSidebarShowAll();
+        const msg = showAll
+          ? "Sidebar subagents: showing all subagents"
+          : "Sidebar subagents: showing last 5 subagents";
+        ctx.ui.notify(msg, "info");
+        ctx.ui.requestRender();
+        return;
+      }
+
+      if (
+        trimmedArg &&
+        (trimmedArg === "toggle" ||
+          trimmedArg.startsWith("toggle ") ||
+          trimmedArg === "sidebar" ||
+          trimmedArg.startsWith("sidebar ") ||
+          trimmedArg === "display" ||
+          trimmedArg.startsWith("display "))
+      ) {
         const parts = trimmedArg.split(/\s+/);
         handleDisplayToggle(parts.slice(1).join(" "), ctx);
         return;
@@ -109,46 +176,37 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
         return;
       }
 
-      // Determine target subagent
-      let target: typeof all[0] | undefined;
-
+      let target: (typeof all)[0] | undefined;
       if (trimmedArg) {
         target = all.find((s) => s.id === trimmedArg || s.id.includes(trimmedArg));
       }
 
-      if (!target) {
-        if (all.length === 1) {
-          target = all[0];
-        } else {
-          const options = all.map((s) => {
-            const icon = s.status === "running" ? "⠋" : s.status === "completed" ? "●" : "▲";
-            const dur = s.durationMs
-              ? `${(s.durationMs / 1000).toFixed(1)}s`
-              : `${((Date.now() - s.startTime) / 1000).toFixed(1)}s`;
-            const title = s.description || (s.task.length > 40 ? `${s.task.slice(0, 37)}...` : s.task);
-            return `${icon} [${s.id}] "${title}" (${s.status}, ${dur})`;
+      // Open native Pi-style SubagentViewer (matching Pi's fork / tree UX) as fullscreen overlay
+      await ctx.ui.custom(
+        (tui, theme, _kb, done) => {
+          return new SubagentViewer({
+            initialMode: target ? "transcript" : "list",
+            id: target?.id,
+            task: target ? target.description || target.task : undefined,
+            logPath: target?.logFile,
+            theme,
+            tui,
+            tracker: globalSubagentTracker,
+            done,
+            canGoBackToList: target ? false : true,
           });
-
-          const selected = await ctx.ui.select("Select a subagent to peer into:", options);
-          if (selected === undefined) return;
-          const idx = options.indexOf(selected);
-          target = all[idx];
+        },
+        {
+          overlay: true,
+          overlayOptions: {
+            anchor: "top-left",
+            row: 0,
+            col: 0,
+            width: "100%",
+            maxHeight: "100%",
+          },
         }
-      }
-
-      if (!target) return;
-
-      await ctx.ui.custom((tui, theme, _kb, done) => {
-        return new SubagentViewer({
-          id: target.id,
-          task: target.task,
-          logPath: target.logFile,
-          theme,
-          tui,
-          tracker: globalSubagentTracker,
-          done,
-        });
-      });
+      );
     },
   });
 
@@ -163,23 +221,80 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
     handler: async (args, ctx) => handleDisplayToggle(args, ctx),
   });
 
+  pi.registerCommand("subagents-more", {
+    description: "Toggle displaying all subagents vs last 5 in the sidebar panel",
+    handler: async (_args, ctx) => {
+      const showAll = globalSubagentTracker.toggleSidebarShowAll();
+      const msg = showAll
+        ? "Sidebar subagents: showing all subagents"
+        : "Sidebar subagents: showing last 5 subagents";
+      ctx.ui.notify(msg, "info");
+      ctx.ui.requestRender();
+    },
+  });
+
+  const toolDescription = [
+    "Spawns an agent in a child session to work on the specified task.",
+    "The output includes a sessionID you can pass back later to continue that specific conversation with the subagent.",
+    "New child sessions start with fresh context, so include all relevant context and instructions when you don't pass a sessionID.",
+    "Non-blocking background mode (default) launches the subagent asynchronously and returns immediately so the main chat is never held; you are notified when it finishes.",
+    "Foreground mode (background=false) blocks until the subagent completes.",
+    "",
+    "Available subagents:",
+    "- general: General-purpose agent for researching complex questions and executing multi-step tasks.",
+    "- explore: Fast agent specialized for exploring codebases (read-only searcher).",
+  ].join("\n");
+
   pi.registerTool({
     name: "subagent",
     label: "Subagent",
-    description:
-      "Delegate tasks to autonomous child agents in isolated Git worktrees. Call multiple subagents in parallel in a single turn for independent tasks.",
-    promptSnippet: "Delegate tasks to isolated subagents (supports parallel calls)",
+    description: toolDescription,
+    promptSnippet: "Delegate tasks to specialized subagents (non-blocking by default; supports parallel calls, continuation, and background)",
     promptGuidelines: [
+      "Subagents run asynchronously in the background by default without blocking the main chat. Set background=false only if you must synchronously wait for the result before continuing.",
       "Dispatch multiple subagent calls in parallel within a single turn for independent tasks.",
+      "Use agent='explore' for read-only codebase exploration, keyword search, or file inspection.",
+      "Pass sessionID to continue an existing child conversation instead of starting from scratch.",
     ],
     parameters: Type.Object(
       {
-        task: Type.String({
-          description: "Task description for the subagent to perform autonomously",
-        }),
+        task: Type.Optional(
+          Type.String({
+            description: "Task description for the subagent to perform autonomously",
+          })
+        ),
+        prompt: Type.Optional(
+          Type.String({
+            description: "Alias for task. The task for the subagent to perform.",
+          })
+        ),
+        agent: Type.Optional(
+          Type.String({
+            description:
+              "The type of specialized agent to use ('general', 'explore', or custom agent name). Defaults to 'general'.",
+          })
+        ),
         description: Type.Optional(
           Type.String({
             description: "A short 3-5 word summary/title of the task for the UI header",
+          })
+        ),
+        sessionID: Type.Optional(
+          Type.String({
+            description:
+              "Continue a specific previous subagent conversation by passing its sessionID. Calls without a sessionID start a new conversation.",
+          })
+        ),
+        background: Type.Optional(
+          Type.Boolean({
+            description:
+              "Run the subagent in the background without blocking the main chat (default true). Set to false to block until complete.",
+          })
+        ),
+        model: Type.Optional(
+          Type.String({
+            description:
+              "Optional model override for this subagent (e.g. 'providerID/modelID' or model name).",
           })
         ),
         isolated: Type.Optional(
@@ -196,14 +311,98 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       globalSubagentTracker.setUIContext(ctx);
       const depth = parseInt(process.env.PI_SUBAGENT_DEPTH ?? "0", 10);
+      const task = params.task || params.prompt || "";
+      const isBackground = params.background !== false;
+
       const result = await executeSubagent({
-        task: params.task,
+        task,
+        prompt: task,
+        agent: params.agent,
         description: params.description,
+        sessionID: params.sessionID,
+        background: isBackground,
+        model: params.model,
         cwd: ctx.cwd,
         isolated: params.isolated ?? true,
         currentDepth: depth,
         signal,
         onUpdate,
+        uiContext: ctx,
+        onBackgroundComplete: (bgResult) => {
+          // Deliver completion record to session JSONL
+          try {
+            if (ctx.sessionManager && typeof ctx.sessionManager.appendCustomEntry === "function") {
+              ctx.sessionManager.appendCustomEntry("subagent_record", {
+                id: bgResult.id,
+                sessionID: bgResult.sessionID,
+                task,
+                description: params.description,
+                startTime: Date.now() - (bgResult.durationMs ?? 0),
+                endTime: Date.now(),
+                durationMs: bgResult.durationMs,
+                status: bgResult.status,
+                isolated: params.isolated ?? true,
+                logFile: (bgResult as any).logFile,
+                currentLine: "Done",
+                stats: bgResult.stats,
+              });
+            }
+          } catch {}
+
+          // Automatically deliver subagent response into main chat
+          const settings = loadSubagentSettings();
+          if (settings.autoDeliver !== false) {
+            try {
+              const envelope = formatSubagentEnvelope({
+                id: bgResult.id,
+                sessionID: bgResult.sessionID,
+                status: bgResult.status as any,
+                durationMs: bgResult.durationMs,
+                summary: bgResult.summary,
+                stats: bgResult.stats,
+                logFilePath: (bgResult as any).logFile,
+              });
+
+              // Deliver visually compacted response using sendMessage if supported, else sendUserMessage
+              if (typeof (pi as any).sendMessage === "function") {
+                (pi as any).sendMessage(
+                  {
+                    customType: "subagent-response",
+                    content: envelope,
+                    display: true,
+                    details: {
+                      id: bgResult.id,
+                      sessionID: bgResult.sessionID,
+                      status: bgResult.status,
+                      durationMs: bgResult.durationMs,
+                      summary: bgResult.summary,
+                      stats: bgResult.stats,
+                      logFile: (bgResult as any).logFile,
+                      task,
+                      description: params.description,
+                      agent: params.agent,
+                    },
+                  },
+                  {
+                    triggerTurn: true,
+                    deliverAs: isAgentActive ? "steer" : undefined,
+                  }
+                );
+              } else if (typeof (pi as any).sendUserMessage === "function") {
+                if (isAgentActive) {
+                  // If main chat is working, queue with deliverAs: "steer"
+                  // Pi prioritizes steering messages ahead of queued user follow-ups!
+                  (pi as any).sendUserMessage(envelope, { deliverAs: "steer" });
+                } else {
+                  // If main chat is idle, restart main chat so it responds immediately
+                  (pi as any).sendUserMessage(envelope);
+                }
+              }
+            } catch (err) {
+              console.error("Failed to deliver subagent response to main chat:", err);
+            }
+          }
+        },
       });
 
       const cumulative = globalSubagentTracker.getCumulativeStats();
@@ -217,25 +416,29 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
         });
       }
 
-      // Persist subagent metadata to session JSONL so it survives session exit and rejoin
-      try {
-        if (ctx.sessionManager && typeof ctx.sessionManager.appendCustomEntry === "function") {
-          ctx.sessionManager.appendCustomEntry("subagent_record", {
-            id: result.details.id,
-            task: result.details.task,
-            description: result.details.description,
-            startTime: Date.now() - (result.details.durationMs ?? 0),
-            endTime: Date.now(),
-            durationMs: result.details.durationMs,
-            status: result.details.status,
-            isolated: result.details.isolated,
-            logFile: result.details.logFile,
-            exitCode: result.details.exitCode,
-            currentLine: "Done",
-            stats: result.details.stats,
-          });
-        }
-      } catch {}
+      // Persist completed subagent metadata to session JSONL so it survives session exit and rejoin
+      if (!isBackground) {
+        try {
+          if (ctx.sessionManager && typeof ctx.sessionManager.appendCustomEntry === "function") {
+            ctx.sessionManager.appendCustomEntry("subagent_record", {
+              id: result.details.id,
+              sessionID: result.details.sessionID,
+              agent: result.details.agent,
+              task: result.details.task,
+              description: result.details.description,
+              startTime: Date.now() - (result.details.durationMs ?? 0),
+              endTime: Date.now(),
+              durationMs: result.details.durationMs,
+              status: result.details.status,
+              isolated: result.details.isolated,
+              logFile: result.details.logFile,
+              exitCode: result.details.exitCode,
+              currentLine: "Done",
+              stats: result.details.stats,
+            });
+          }
+        } catch {}
+      }
 
       return {
         content: [{ type: "text", text: result.output }],

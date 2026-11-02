@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { SubagentViewer } from "../src/subagent-viewer";
+import { SubagentViewer, getAnimatedProgressBar } from "../src/subagent-viewer";
 import { SubagentTracker } from "../src/tracker";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -53,6 +53,30 @@ describe("SubagentViewer", () => {
     expect(rendered).toContain("Esc/q: Close");
   });
 
+  it("pins title and divider to the top lines of transcript view even when scrolled", () => {
+    const tracker = new SubagentTracker();
+    const viewer = new SubagentViewer({
+      id: "test_sub_pin",
+      task: "Pinned task",
+      logPath: tmpLog,
+      theme: mockTheme,
+      tui: { requestRender: () => {}, terminal: { rows: 20 } },
+      tracker,
+      done: () => {},
+    });
+
+    const lines = viewer.render(80);
+    // Line 0 is top title, Line 1 is top divider
+    expect(lines[0]).toContain("Subagent Transcript: [test_sub_pin]");
+    expect(lines[1]).toContain("─");
+
+    // Scroll down
+    viewer.handleInput("\x1b[B"); // Down arrow
+    const scrolledLines = viewer.render(80);
+    expect(scrolledLines[0]).toContain("Subagent Transcript: [test_sub_pin]");
+    expect(scrolledLines[1]).toContain("─");
+  });
+
   it("closes when escape or q is pressed", () => {
     let closed = false;
     const tracker = new SubagentTracker();
@@ -69,6 +93,29 @@ describe("SubagentViewer", () => {
     });
 
     viewer.handleInput("q");
+    expect(closed).toBe(true);
+  });
+
+  it("closes directly on one escape when opened for a specific subagent even with multiple subagents", () => {
+    let closed = false;
+    const tracker = new SubagentTracker();
+    tracker.registerStart({ id: "agent_1", task: "Task 1", isolated: true, logFile: tmpLog });
+    tracker.registerStart({ id: "agent_2", task: "Task 2", isolated: true, logFile: tmpLog });
+
+    const viewer = new SubagentViewer({
+      id: "agent_1",
+      task: "Task 1",
+      logPath: tmpLog,
+      theme: mockTheme,
+      tui: { requestRender: () => {} },
+      tracker,
+      canGoBackToList: false,
+      done: () => {
+        closed = true;
+      },
+    });
+
+    viewer.handleInput("\x1b"); // Escape
     expect(closed).toBe(true);
   });
 
@@ -98,5 +145,230 @@ describe("SubagentViewer", () => {
     // Send mouse wheel down (SGR 1006)
     viewer.handleInput("\x1b[<65;20;10M");
     expect(renderRequested).toBeGreaterThan(prevCount);
+
+    // Also test normalized TuiMouseEvent handleMouse
+    const resUp = viewer.handleMouse({ type: "wheel", wheelDelta: -1 });
+    expect(resUp?.handled).toBe(true);
+
+    const resDown = viewer.handleMouse({ type: "wheel", wheelDelta: 1 });
+    expect(resDown?.handled).toBe(true);
+  });
+
+  it("renders native Pi selector list when multiple subagents exist", () => {
+    const tracker = new SubagentTracker();
+    tracker.registerStart({
+      id: "sub_alpha",
+      task: "Alpha task for testing",
+      agent: "general",
+      isolated: true,
+      logFile: tmpLog,
+    });
+    tracker.registerStart({
+      id: "sub_beta",
+      task: "Beta task for exploring",
+      agent: "explore",
+      isolated: true,
+      logFile: tmpLog,
+    });
+
+    let closed = false;
+    const viewer = new SubagentViewer({
+      theme: mockTheme,
+      tui: { requestRender: () => {} },
+      tracker,
+      done: () => {
+        closed = true;
+      },
+    });
+
+    const rendered = viewer.render(80).join("\n");
+    // Verify native Pi header
+    expect(rendered).toContain("Subagents");
+    expect(rendered).toContain("Select a subagent to view live transcript");
+
+    // Verify cursor and items layout (Pi UserMessageSelectorComponent style)
+    expect(rendered).toContain("› Alpha task for testing");
+    expect(rendered).toContain("Beta task for exploring");
+    expect(rendered).toContain("[sub_alpha]");
+    expect(rendered).toContain("[sub_beta]");
+
+    // Verify keybinding footer
+    expect(rendered).toContain("↑/↓ navigate");
+    expect(rendered).toContain("enter view transcript");
+    expect(rendered).toContain("esc close");
+  });
+
+  it("navigates selection and transitions between list and transcript modes", () => {
+    const tracker = new SubagentTracker();
+    tracker.registerStart({
+      id: "sub_1",
+      task: "First task",
+      agent: "general",
+      isolated: true,
+      logFile: tmpLog,
+    });
+    tracker.registerStart({
+      id: "sub_2",
+      task: "Second task",
+      agent: "explore",
+      isolated: true,
+      logFile: tmpLog,
+    });
+
+    let closed = false;
+    let renders = 0;
+    const viewer = new SubagentViewer({
+      theme: mockTheme,
+      tui: { requestRender: () => { renders++; } },
+      tracker,
+      done: () => {
+        closed = true;
+      },
+    });
+
+    // Initially on first item
+    let output = viewer.render(80).join("\n");
+    expect(output).toContain("› First task");
+
+    // Move down
+    viewer.handleInput("j");
+    output = viewer.render(80).join("\n");
+    expect(output).toContain("› Second task");
+
+    // Press Enter to view transcript for Second task
+    viewer.handleInput("\r");
+    output = viewer.render(80).join("\n");
+    expect(output).toContain("Subagent Transcript: [sub_2]");
+    expect(output).toContain("Agent: explore");
+    expect(output).toContain("Line 1: Starting test");
+    expect(output).toContain("Back to list");
+
+    // Press Esc to return back to list
+    viewer.handleInput("\x1b");
+    output = viewer.render(80).join("\n");
+    expect(output).toContain("Subagents");
+    expect(output).toContain("Select a subagent to view live transcript");
+    expect(closed).toBe(false);
+
+    // Press Esc from list to close
+    viewer.handleInput("\x1b");
+    expect(closed).toBe(true);
+  });
+
+  it("animates moving progress bar across frames", () => {
+    const bar0 = getAnimatedProgressBar(0, 8);
+    const bar3 = getAnimatedProgressBar(3, 8);
+    expect(bar0).toContain("█");
+    expect(bar3).toContain("█");
+    expect(bar0).not.toBe(bar3);
+  });
+
+  it("renders animated progress bar and live activity peek for running subagent in list", () => {
+    const tracker = new SubagentTracker();
+    tracker.registerStart({
+      id: "sub_running",
+      task: "Active running task",
+      agent: "explore",
+      isolated: true,
+      logFile: tmpLog,
+    });
+    tracker.updatePeek("sub_running", "Searching for files in src/...");
+
+    const viewer = new SubagentViewer({
+      initialMode: "list",
+      theme: mockTheme,
+      tui: { requestRender: () => {} },
+      tracker,
+      done: () => {},
+    });
+
+    const output = viewer.render(80).join("\n");
+    expect(output).toContain("running");
+    expect(output).toContain("[sub_running]");
+    // Checks that progress bar and peek are rendered
+    expect(output).toContain("░");
+    expect(output).toContain("Searching for files in src/...");
+  });
+
+  it("renders structured chat turns from session JSONL file", () => {
+    const subId = "sub_jsonl_chat_test";
+    const sessionsDir = path.join(os.homedir(), ".pi", "agent", "subagents", "sessions");
+    if (!fs.existsSync(sessionsDir)) {
+      fs.mkdirSync(sessionsDir, { recursive: true });
+    }
+    const jsonlFile = path.join(sessionsDir, `2026-10-25T00-00-00-000Z_${subId}.jsonl`);
+
+    const entries = [
+      { type: "session", id: subId },
+      {
+        type: "message",
+        message: {
+          role: "user",
+          content: [{ type: "text", text: "You are a subagent spawned by another session.\nCalculate sum of 2 and 2." }],
+        },
+      },
+      {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "toolCall", id: "tc_1", name: "bash", arguments: { command: "echo 4" } },
+          ],
+        },
+      },
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolCallId: "tc_1",
+          toolName: "bash",
+          content: [{ type: "text", text: "4\n" }],
+        },
+      },
+      {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "The sum of 2 and 2 is 4." }],
+        },
+      },
+    ];
+
+    fs.writeFileSync(jsonlFile, entries.map((e) => JSON.stringify(e)).join("\n"));
+
+    try {
+      const tracker = new SubagentTracker();
+      tracker.registerStart({
+        id: subId,
+        task: "Calculate sum of 2 and 2",
+        agent: "general",
+        isolated: false,
+        logFile: tmpLog,
+      });
+
+      const viewer = new SubagentViewer({
+        id: subId,
+        initialMode: "transcript",
+        theme: mockTheme,
+        tui: { requestRender: () => {} },
+        tracker,
+        done: () => {},
+      });
+
+      const output = viewer.render(80).join("\n");
+      // Header check
+      expect(output).toContain("Subagent Transcript: [sub_jsonl_chat_test]");
+      expect(output).toContain("[read-only]");
+
+      // Chat turn checks
+      expect(output).toContain("Calculate sum of 2 and 2.");
+      expect(output).toContain("$ echo 4");
+      expect(output).toContain("4");
+      expect(output).toContain("The sum of 2 and 2 is 4.");
+    } finally {
+      try {
+        fs.unlinkSync(jsonlFile);
+      } catch {}
+    }
   });
 });

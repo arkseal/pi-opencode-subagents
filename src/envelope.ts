@@ -2,11 +2,13 @@ import type { SubagentStats } from "./event-parser.js";
 
 export interface TaskResultOptions {
   id: string;
-  status: "completed" | "failed" | "aborted";
+  sessionID?: string;
+  status: "completed" | "failed" | "aborted" | "running";
   durationMs: number;
   summary: string;
   logFilePath?: string;
   stats?: SubagentStats;
+  tag?: "task-result" | "subagent";
 }
 
 export function truncateToBudget(text: string, maxChars = 2000): string {
@@ -14,7 +16,7 @@ export function truncateToBudget(text: string, maxChars = 2000): string {
   return `${text.slice(0, maxChars)}\n... [Output truncated to fit context budget]`;
 }
 
-function formatTokensShort(n: number): string {
+export function formatTokensShort(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
   return String(n);
@@ -23,6 +25,7 @@ function formatTokensShort(n: number): string {
 export function formatTaskResultEnvelope(opts: TaskResultOptions): string {
   const durationSec = (opts.durationMs / 1000).toFixed(1);
   const boundedSummary = truncateToBudget(opts.summary, 2000);
+  const tag = opts.tag ?? "task-result";
 
   let statsAttr = "";
   if (opts.stats && (opts.stats.totalTokens > 0 || opts.stats.toolCalls > 0)) {
@@ -31,8 +34,11 @@ export function formatTaskResultEnvelope(opts: TaskResultOptions): string {
     if (opts.stats.cost && opts.stats.cost > 0) statsAttr += ` cost="$${opts.stats.cost.toFixed(4)}"`;
   }
 
+  const idAttr = tag === "subagent" ? `sessionID="${opts.sessionID || opts.id}"` : `id="${opts.id}"`;
+  const stateAttr = tag === "subagent" ? `state="${opts.status}"` : `status="${opts.status}"`;
+
   const lines = [
-    `<task-result id="${opts.id}" status="${opts.status}" duration="${durationSec}s"${statsAttr}>`,
+    `<${tag} ${idAttr} ${stateAttr} duration="${durationSec}s"${statsAttr}>`,
     boundedSummary,
   ];
 
@@ -52,6 +58,10 @@ export function formatTaskResultEnvelope(opts: TaskResultOptions): string {
     lines.push(`Full transcript: ${opts.logFilePath}`);
   }
 
-  lines.push("</task-result>");
+  lines.push(`</${tag}>`);
   return lines.join("\n");
+}
+
+export function formatSubagentEnvelope(opts: TaskResultOptions): string {
+  return formatTaskResultEnvelope({ ...opts, tag: "subagent" });
 }

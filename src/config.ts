@@ -8,12 +8,16 @@ export interface SubagentSettings {
   displayMode: SubagentDisplayMode;
   sidebarEnabled: boolean;
   widgetEnabled: boolean;
+  autoDeliver: boolean;
+  sidebarShowAll: boolean;
 }
 
 export const DEFAULT_SUBAGENT_SETTINGS: SubagentSettings = {
   displayMode: "both",
   sidebarEnabled: true,
   widgetEnabled: true,
+  autoDeliver: true,
+  sidebarShowAll: false,
 };
 
 function getSettingsPath(): string {
@@ -41,11 +45,15 @@ export function loadSubagentSettings(): SubagentSettings {
 
     const sidebarEnabled = displayMode === "sidebar" || displayMode === "both";
     const widgetEnabled = displayMode === "input" || displayMode === "both";
+    const autoDeliver = parsed.autoDeliver ?? true;
+    const sidebarShowAll = Boolean(parsed.sidebarShowAll);
 
     return {
       displayMode,
       sidebarEnabled,
       widgetEnabled,
+      autoDeliver,
+      sidebarShowAll,
     };
   } catch {
     return { ...DEFAULT_SUBAGENT_SETTINGS };

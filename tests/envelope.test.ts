@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { formatTaskResultEnvelope, truncateToBudget } from "../src/envelope";
+import { formatSubagentEnvelope, formatTaskResultEnvelope, truncateToBudget } from "../src/envelope";
 
 describe("Subagent Task Result Envelope", () => {
   it("wraps clean concise output in structured XML envelope", () => {
@@ -48,5 +48,32 @@ describe("Subagent Task Result Envelope", () => {
     expect(envelope).toContain('cache_read="12000"');
     expect(envelope).toContain('tool_calls="3"');
     expect(envelope).toContain("Stats: 4.5k in · 320 out · 12.0k cache · 3 tools · $0.008");
+  });
+
+  it("formats OpenCode-style <subagent> envelope with sessionID and state attributes", () => {
+    const envelope = formatSubagentEnvelope({
+      id: "subagent_98a2f1",
+      sessionID: "subagent_98a2f1",
+      status: "completed",
+      durationMs: 5100,
+      summary: "Found bug in authentication token refresher.",
+      stats: {
+        tokensIn: 3200,
+        tokensOut: 450,
+        cacheRead: 8000,
+        cacheWrite: 0,
+        totalTokens: 11650,
+        cost: 0.005,
+        toolCalls: 4,
+        turns: 1,
+      },
+    });
+
+    expect(envelope).toContain('<subagent sessionID="subagent_98a2f1" state="completed" duration="5.1s"');
+    expect(envelope).toContain('tokens_in="3200"');
+    expect(envelope).toContain('tokens_out="450"');
+    expect(envelope).toContain('tool_calls="4"');
+    expect(envelope).toContain("Found bug in authentication token refresher.");
+    expect(envelope).toContain("</subagent>");
   });
 });

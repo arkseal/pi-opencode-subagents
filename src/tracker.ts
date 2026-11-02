@@ -1,14 +1,70 @@
 import { type Component, stripTerminalSequences, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import type { SubagentStats } from "./event-parser.js";
 import { loadSubagentSettings, saveSubagentSettings, type SubagentSettings, type SubagentDisplayMode } from "./config.js";
+import { activeSubagentProcesses, getSubagentDir, getSubagentSessionsDir } from "./runner.js";
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const GRACE_PERIOD_MS = 1200;
 
+/**
+ * Reconciles subagent status on disk when process is no longer alive.
+ * Checks whether the subagent's session JSONL or log file contains a completed response.
+ */
+export function checkSubagentCompletionOnDisk(
+  id: string,
+  logFilePath?: string
+): {
+  status: "completed" | "failed" | "aborted" | "running";
+  stats?: SubagentStats;
+  durationMs?: number;
+} {
+  try {
+    const sessionsDir = getSubagentSessionsDir();
+    if (fs.existsSync(sessionsDir)) {
+      const files = fs.readdirSync(sessionsDir);
+      const match = files.find((f) => f.includes(id) && f.endsWith(".jsonl"));
+      if (match) {
+        const fullPath = path.join(sessionsDir, match);
+        const content = fs.readFileSync(fullPath, "utf-8");
+        const lines = content.split("\n").filter(Boolean);
+        const entries = lines
+          .map((l) => {
+            try {
+              return JSON.parse(l);
+            } catch {
+              return null;
+            }
+          })
+          .filter(Boolean);
+
+        const hasAssistant = entries.some(
+          (e) =>
+            e.type === "message" &&
+            e.message?.role === "assistant" &&
+            e.message?.content?.some((c: any) => c.type === "text" && c.text)
+        );
+        const hasSessionInfo = entries.some((e) => e.type === "session_info");
+
+        if (hasAssistant || hasSessionInfo) {
+          return { status: "completed" };
+        }
+      }
+    }
+  } catch {}
+
+  return { status: "running" };
+}
+
 export interface TrackedSubagent {
   id: string;
+  sessionID?: string;
   task: string;
   description?: string;
+  agent?: string;
+  background?: boolean;
+  model?: string;
   startTime: number;
   endTime?: number;
   durationMs?: number;
@@ -38,17 +94,14 @@ class PinnedSubagentsWidget implements Component {
     const spinner = this.theme.fg("accent", SPINNER_FRAMES[this.tracker.getFrameIndex()]);
 
     const lines: string[] = [];
-    // Keep a 2-column safety margin from the sidebar divider so the right border is 100% visible and never wraps
     const boxWidth = Math.max(25, width - 2);
-    const innerContentWidth = boxWidth - 4;
 
-    // 1. Top Border
-    const titlePrefix = " Subagents ";
-    const countStr = `(${runningCount} running${completedCount > 0 ? ` · ${completedCount} done` : ""}) `;
-    const headerPrefix = `${this.theme.fg("dim", "╭─")}${this.theme.bold(this.theme.fg("toolTitle", titlePrefix))}${this.theme.fg("accent", countStr)}`;
-    const headerLen = visibleWidth(titlePrefix) + visibleWidth(countStr);
-    const ruleLen = Math.max(2, boxWidth - headerLen - 3);
-    lines.push(`${headerPrefix}${this.theme.fg("dim", "─".repeat(ruleLen) + "╮")}`);
+    // 1. Clean Top Divider
+    const title = "Subagents";
+    const countStr = `(${runningCount} running${completedCount > 0 ? ` · ${completedCount} done` : ""})`;
+    const header = `${this.theme.bold(this.theme.fg("accent", title))} ${this.theme.fg("muted", countStr)}`;
+    const lineLen = Math.max(2, boxWidth - visibleWidth(header) - 3);
+    lines.push(`${this.theme.fg("dim", "──")} ${header} ${this.theme.fg("dim", "─".repeat(lineLen))}`);
 
     // 2. Active / Completed Items
     for (const s of items) {
@@ -57,40 +110,33 @@ class PinnedSubagentsWidget implements Component {
         1000
       ).toFixed(1);
 
-      const maxTitleLen = Math.max(12, Math.floor(innerContentWidth * 0.42));
+      const maxTitleLen = Math.max(12, Math.floor(boxWidth * 0.45));
       const title = s.description || (s.task.length > maxTitleLen ? `${s.task.slice(0, maxTitleLen - 3)}...` : s.task);
+      const agentTag = s.agent && s.agent !== "general" ? ` ${this.theme.fg("accent", `[${s.agent}]`)}` : "";
 
       if (s.status === "running") {
         const icon = spinner;
         const mode = s.isolated ? this.theme.fg("dim", "[isolated]") : this.theme.fg("warning", "[shared]");
-        const mainLine = `  ${icon} ${this.theme.fg("accent", `[${s.id}]`)} ${this.theme.bold(`"${title}"`)} · ${this.theme.fg("dim", `${elapsedSec}s`)} ${mode}`;
-        
-        const truncated = truncateToWidth(mainLine, innerContentWidth);
-        const padSpaces = Math.max(0, innerContentWidth - visibleWidth(truncated));
-        lines.push(`${this.theme.fg("dim", "│")} ${truncated}${" ".repeat(padSpaces)} ${this.theme.fg("dim", "│")}`);
+        const bgTag = s.background ? ` ${this.theme.fg("dim", "[bg]")}` : "";
+        const mainLine = `  ${icon} ${this.theme.fg("accent", `[${s.id}]`)}${agentTag} ${this.theme.bold(`"${title}"`)} · ${this.theme.fg("dim", `${elapsedSec}s`)} ${mode}${bgTag}`;
+        lines.push(truncateToWidth(mainLine, boxWidth));
 
         if (s.currentLine) {
           const clean = stripTerminalSequences(s.currentLine.replace(/[\r\n\t]+/g, " ").trim());
           const peekText = `    ${this.theme.fg("muted", "↳")} ${this.theme.fg("dim", clean)}`;
-          const truncatedPeek = truncateToWidth(peekText, innerContentWidth);
-          const padPeek = Math.max(0, innerContentWidth - visibleWidth(truncatedPeek));
-          lines.push(`${this.theme.fg("dim", "│")} ${truncatedPeek}${" ".repeat(padPeek)} ${this.theme.fg("dim", "│")}`);
+          lines.push(truncateToWidth(peekText, boxWidth));
         }
       } else if (s.status === "completed") {
-        const doneLine = `  ${this.theme.fg("success", "●")} ${this.theme.fg("dim", `[${s.id}]`)} ${this.theme.fg("toolTitle", `"${title}"`)} · ${this.theme.fg("success", `done in ${elapsedSec}s`)}`;
-        const truncated = truncateToWidth(doneLine, innerContentWidth);
-        const padSpaces = Math.max(0, innerContentWidth - visibleWidth(truncated));
-        lines.push(`${this.theme.fg("dim", "│")} ${truncated}${" ".repeat(padSpaces)} ${this.theme.fg("dim", "│")}`);
+        const doneLine = `  ${this.theme.fg("success", "●")} ${this.theme.fg("dim", `[${s.id}]`)}${agentTag} ${this.theme.fg("toolTitle", `"${title}"`)} · ${this.theme.fg("success", `done in ${elapsedSec}s`)}`;
+        lines.push(truncateToWidth(doneLine, boxWidth));
       } else {
-        const failLine = `  ${this.theme.fg("error", "▲")} ${this.theme.fg("dim", `[${s.id}]`)} ${this.theme.fg("error", `"${title}"`)} · ${this.theme.fg("error", `failed (exit ${s.exitCode ?? 1})`)}`;
-        const truncated = truncateToWidth(failLine, innerContentWidth);
-        const padSpaces = Math.max(0, innerContentWidth - visibleWidth(truncated));
-        lines.push(`${this.theme.fg("dim", "│")} ${truncated}${" ".repeat(padSpaces)} ${this.theme.fg("dim", "│")}`);
+        const failLine = `  ${this.theme.fg("error", "▲")} ${this.theme.fg("dim", `[${s.id}]`)}${agentTag} ${this.theme.fg("error", `"${title}"`)} · ${this.theme.fg("error", `failed (exit ${s.exitCode ?? 1})`)}`;
+        lines.push(truncateToWidth(failLine, boxWidth));
       }
     }
 
-    // 3. Bottom Border (completely closed on both ends)
-    lines.push(this.theme.fg("dim", "╰" + "─".repeat(Math.max(2, boxWidth - 2)) + "╯"));
+    // 3. Clean Bottom Divider
+    lines.push(this.theme.fg("dim", "─".repeat(Math.max(2, boxWidth))));
     return lines;
   }
 }
@@ -106,6 +152,11 @@ export class SubagentTracker {
   private sidebarRegistered = false;
   private theme: any = null;
   private settings: SubagentSettings = loadSubagentSettings();
+  private sidebarRowToSubagentMap = new Map<number, string>();
+
+  constructor() {
+    (globalThis as any).__PI_SUBAGENTS_TRACKER__ = this;
+  }
 
   setTheme(theme: any) {
     this.theme = theme;
@@ -175,9 +226,61 @@ export class SubagentTracker {
     }
   }
 
+  toggleSidebarShowAll(): boolean {
+    this.settings.sidebarShowAll = !this.settings.sidebarShowAll;
+    saveSubagentSettings({ sidebarShowAll: this.settings.sidebarShowAll });
+    this.notifyRender();
+    return this.settings.sidebarShowAll;
+  }
+
+  isSidebarShowAll(): boolean {
+    return this.settings.sidebarShowAll;
+  }
+
+  async openViewer(subagentId?: string) {
+    if (!this.uiContext?.hasUI || typeof this.uiContext.ui?.custom !== "function") return;
+    const all = [...this.active.values(), ...this.recent];
+    const target = subagentId ? all.find((s) => s.id === subagentId || s.id.includes(subagentId)) : undefined;
+
+    try {
+      const { SubagentViewer } = await import("./subagent-viewer.js");
+      await this.uiContext.ui.custom(
+        (tui: any, theme: any, _kb: any, done: () => void) => {
+          return new SubagentViewer({
+            initialMode: target ? "transcript" : "list",
+            id: target?.id,
+            task: target ? target.description || target.task : undefined,
+            logPath: target?.logFile,
+            theme,
+            tui,
+            tracker: this,
+            done,
+            canGoBackToList: target ? false : true,
+          });
+        },
+        {
+          overlay: true,
+          overlayOptions: {
+            anchor: "top-left",
+            row: 0,
+            col: 0,
+            width: "100%",
+            maxHeight: "100%",
+          },
+        }
+      );
+    } catch (err) {
+      console.error("Failed to open SubagentViewer:", err);
+    }
+  }
+
   setUIContext(ctx: any) {
     this.uiContext = ctx;
     this.ensureSidebarPanel();
+    const hasRunning = Array.from(this.active.values()).some((s) => s.status === "running");
+    if (hasRunning) {
+      this.ensureTicker();
+    }
   }
 
   getFrameIndex(): number {
@@ -186,8 +289,12 @@ export class SubagentTracker {
 
   registerStart(subagent: {
     id: string;
+    sessionID?: string;
     task: string;
     description?: string;
+    agent?: string;
+    background?: boolean;
+    model?: string;
     isolated: boolean;
     logFile: string;
   }) {
@@ -198,8 +305,12 @@ export class SubagentTracker {
 
     const tracked: TrackedSubagent = {
       id: subagent.id,
+      sessionID: subagent.sessionID ?? subagent.id,
       task: subagent.task,
       description: subagent.description,
+      agent: subagent.agent,
+      background: subagent.background,
+      model: subagent.model,
       startTime: Date.now(),
       status: "running",
       isolated: subagent.isolated,
@@ -260,7 +371,18 @@ export class SubagentTracker {
       if (result.stats) {
         item.stats = result.stats;
       }
-      this.recent = [item, ...this.recent.filter((r) => r.id !== id)].slice(0, 15);
+      this.recent = [item, ...this.recent.filter((r) => r.id !== id)].slice(0, 50);
+      this.active.delete(id);
+    } else {
+      const existing = this.recent.find((r) => r.id === id);
+      if (existing) {
+        existing.status = result.status;
+        existing.exitCode = result.exitCode;
+        existing.endTime = Date.now();
+        existing.durationMs = result.durationMs ?? (existing.endTime - existing.startTime);
+        existing.currentLine = result.status === "completed" ? "Done" : `Exited with code ${result.exitCode ?? 1}`;
+        if (result.stats) existing.stats = result.stats;
+      }
     }
 
     const hasRunning = Array.from(this.active.values()).some((s) => s.status === "running");
@@ -271,13 +393,32 @@ export class SubagentTracker {
       // Grace period to show completion in the box before unmounting
       if (this.clearTimer) clearTimeout(this.clearTimer);
       this.clearTimer = setTimeout(() => {
-        this.active.clear();
         this.unmountWidget();
         this.notifyRender();
       }, GRACE_PERIOD_MS);
     } else {
       this.notifyRender();
     }
+  }
+
+  stopAll() {
+    if (this.clearTimer) {
+      clearTimeout(this.clearTimer);
+      this.clearTimer = null;
+    }
+    for (const [id, item] of this.active.entries()) {
+      if (item.status === "running") {
+        item.status = "aborted";
+        item.endTime = Date.now();
+        item.durationMs = item.endTime - item.startTime;
+        item.currentLine = "Aborted";
+        this.recent = [item, ...this.recent.filter((r) => r.id !== id)].slice(0, 15);
+      }
+    }
+    this.active.clear();
+    this.stopTicker();
+    this.unmountWidget();
+    this.notifyRender();
   }
 
   getActiveList(): TrackedSubagent[] {
@@ -289,9 +430,40 @@ export class SubagentTracker {
   }
 
   restoreRecent(items: TrackedSubagent[]) {
-    const existingIds = new Set(this.recent.map((r) => r.id));
-    const toAdd = items.filter((item) => !existingIds.has(item.id));
-    this.recent = [...toAdd, ...this.recent].slice(0, 50);
+    const byId = new Map<string, TrackedSubagent>();
+
+    // Seed with existing recent
+    for (const r of this.recent) {
+      byId.set(r.id, r);
+    }
+
+    // Merge restored items in order (latest entry for each ID takes precedence)
+    for (const item of items) {
+      const existing = byId.get(item.id);
+      if (!existing) {
+        byId.set(item.id, { ...item });
+      } else {
+        // A terminal status (completed, failed, aborted) always overrides "running"
+        if (item.status !== "running" || existing.status === "running") {
+          byId.set(item.id, { ...existing, ...item });
+        }
+      }
+    }
+
+    // Reconcile any items still marked "running": check if they finished on disk
+    for (const [id, item] of byId.entries()) {
+      if (item.status === "running" && !activeSubagentProcesses.has(id)) {
+        const diskCheck = checkSubagentCompletionOnDisk(id, item.logFile);
+        if (diskCheck.status !== "running") {
+          item.status = diskCheck.status;
+          item.currentLine = diskCheck.status === "completed" ? "Done" : "Aborted";
+          if (diskCheck.durationMs && !item.durationMs) item.durationMs = diskCheck.durationMs;
+          if (diskCheck.stats && !item.stats) item.stats = diskCheck.stats;
+        }
+      }
+    }
+
+    this.recent = Array.from(byId.values()).slice(0, 50);
   }
 
   getCumulativeStats(): {
@@ -382,25 +554,25 @@ export class SubagentTracker {
   }
 
   private notifyRender() {
-    if (!this.uiContext?.hasUI) return;
-
     const runningCount = Array.from(this.active.values()).filter((s) => s.status === "running").length;
 
     // 1. Update native footer status line
-    if (runningCount > 0) {
-      const spinner = SPINNER_FRAMES[this.frameIndex];
-      this.uiContext.ui.setStatus(
-        "subagents",
-        `${spinner} ${runningCount} subagent${runningCount > 1 ? "s" : ""} active`
-      );
-    } else {
-      this.uiContext.ui.setStatus("subagents", undefined);
-    }
+    if (this.uiContext?.hasUI) {
+      if (runningCount > 0) {
+        const spinner = SPINNER_FRAMES[this.getFrameIndex()];
+        this.uiContext.ui.setStatus(
+          "subagents",
+          `${spinner} ${runningCount} subagent${runningCount > 1 ? "s" : ""} active`
+        );
+      } else {
+        this.uiContext.ui.setStatus("subagents", undefined);
+      }
 
-    // 2. Request UI render
-    try {
-      this.uiContext.ui.requestRender();
-    } catch {}
+      // 2. Request UI render
+      try {
+        this.uiContext.ui.requestRender();
+      } catch {}
+    }
 
     // 3. Notify sidebar if available
     try {
@@ -408,86 +580,164 @@ export class SubagentTracker {
       if (typeof g.__PI_SIDEBAR_TUI__?.requestRender === "function") {
         g.__PI_SIDEBAR_TUI__.requestRender();
       }
+      if (typeof g.__PI_SIDEBAR_REQUEST_RENDER__ === "function") {
+        g.__PI_SIDEBAR_REQUEST_RENDER__();
+      }
     } catch {}
   }
 
   private ensureSidebarPanel() {
     if (!this.settings.sidebarEnabled) return;
-    if (this.sidebarRegistered) return;
     const g = globalThis as any;
+    if (!g.__PI_SIDEBAR_PANELS__) {
+      g.__PI_SIDEBAR_PANELS__ = new Map();
+    }
+
+    const panel = {
+      id: "subagents",
+      order: 15,
+      onClick: (lineText: string, lineIndex: number) => {
+        if (
+          lineText.includes("more subagents") ||
+          lineText.includes("Show less") ||
+          lineText.includes("show less")
+        ) {
+          this.toggleSidebarShowAll();
+          return;
+        }
+
+        const subId = this.sidebarRowToSubagentMap.get(lineIndex);
+        if (subId && subId !== "toggle") {
+          void this.openViewer(subId);
+          return;
+        }
+
+        // Fallback: match by task title or ID from text
+        const all = [...this.active.values(), ...this.recent];
+        const match = all.find((s) => {
+          const t = s.description || s.task;
+          return lineText.includes(s.id) || (t && lineText.includes(t.slice(0, 15)));
+        });
+        if (match) {
+          void this.openViewer(match.id);
+        }
+      },
+      render: (_ctx: any, width: number) => {
+        if (!this.settings.sidebarEnabled) return [];
+
+        // Collect all unique tracked subagents (both active and recent)
+        const allItemsMap = new Map<string, TrackedSubagent>();
+        for (const s of this.recent) allItemsMap.set(s.id, s);
+        for (const s of this.active.values()) allItemsMap.set(s.id, s);
+        const allItems = Array.from(allItemsMap.values());
+        if (allItems.length === 0) return [];
+
+        // Accurate counts across ALL subagents that have run
+        const totalRunning = allItems.filter((s) => s.status === "running").length;
+        const totalCompleted = allItems.filter((s) => s.status === "completed").length;
+        const lines: string[] = [];
+        const rowMap = new Map<number, string>();
+
+        const safeW = Math.max(10, width - 2);
+
+        // Styling helpers: prefer sidebar TUI api, then live pi theme, then ansi codes
+        const sidebarAPI = g.__PI_SIDEBAR_TUI__;
+        const fg = (color: string, str: string) => {
+          if (typeof sidebarAPI?.fg === "function") return sidebarAPI.fg(color, str);
+          if (typeof this.theme?.fg === "function") return this.theme.fg(color, str);
+          if (color === "success") return `\x1b[32m${str}\x1b[39m`;
+          if (color === "error") return `\x1b[31m${str}\x1b[39m`;
+          if (color === "accent") return `\x1b[33m${str}\x1b[39m`;
+          if (color === "dim") return `\x1b[2m${str}\x1b[22m`;
+          return str;
+        };
+        const dim = (str: string) => fg("dim", str);
+        const bold = (str: string) => {
+          if (typeof sidebarAPI?.bold === "function") return sidebarAPI.bold(str);
+          if (typeof this.theme?.bold === "function") return this.theme.bold(str);
+          return `\x1b[1m${str}\x1b[22m`;
+        };
+
+        // Compute animated braille spinner frame directly from real-time clock
+        const currentFrameIndex = this.getFrameIndex();
+        const currentSpinner = SPINNER_FRAMES[currentFrameIndex];
+
+        // Header line with accurate total counts
+        const countLabel = totalRunning > 0
+          ? dim(` (${totalRunning} active${totalCompleted > 0 ? `, ${totalCompleted} done` : ""})`)
+          : totalCompleted > 0
+            ? fg("success", ` (${totalCompleted} done)`)
+            : "";
+        lines.push(bold(" Subagents") + countLabel);
+        lines.push(dim("─".repeat(Math.max(0, safeW))));
+
+        // Display items:
+        // Always show all running items.
+        // For completed items: show latest 5 by default, or all if sidebarShowAll is true.
+        const activeItems = allItems.filter((s) => s.status === "running");
+        const finishedItems = allItems.filter((s) => s.status !== "running");
+
+        const maxFinishedToShow = this.settings.sidebarShowAll ? finishedItems.length : 5;
+        const visibleFinished = finishedItems.slice(0, maxFinishedToShow);
+        const itemsToDisplay = [...activeItems, ...visibleFinished];
+
+        for (const s of itemsToDisplay) {
+          const elapsed = (((s.endTime ?? Date.now()) - s.startTime) / 1000).toFixed(1);
+          const title = s.description || (s.task.length > 24 ? `${s.task.slice(0, 21)}...` : s.task);
+
+          rowMap.set(lines.length, s.id);
+          if (s.status === "running") {
+            const icon = fg("accent", currentSpinner);
+            lines.push(truncateToWidth(`  ${icon} ${bold(`"${title}"`)} ${dim(`(${elapsed}s)`)}`, safeW));
+            if (s.currentLine) {
+              rowMap.set(lines.length, s.id);
+              const clean = s.currentLine.replace(/[\r\n\t]+/g, " ").trim();
+              lines.push(truncateToWidth(`    ↳ ${dim(clean)}`, safeW));
+            }
+          } else if (s.status === "completed") {
+            const icon = fg("success", "●");
+            lines.push(truncateToWidth(`  ${icon} "${title}" · ${fg("success", `done in ${elapsed}s`)}`, safeW));
+          } else {
+            const icon = fg("error", "▲");
+            lines.push(truncateToWidth(`  ${icon} ${fg("error", `"${title}"`)} · ${fg("error", `failed`)}`, safeW));
+          }
+        }
+
+        // Show clickable button if there are more than 5 finished items
+        if (finishedItems.length > 5) {
+          rowMap.set(lines.length, "toggle");
+          if (!this.settings.sidebarShowAll) {
+            const hiddenCount = finishedItems.length - 5;
+            lines.push(
+              truncateToWidth(
+                `  ${fg("accent", "▶")} ${bold(`[View ${hiddenCount} more subagents]`)}`,
+                safeW
+              )
+            );
+          } else {
+            lines.push(
+              truncateToWidth(
+                `  ${fg("accent", "▲")} ${bold("[Show less]")}`,
+                safeW
+              )
+            );
+          }
+        }
+
+        this.sidebarRowToSubagentMap = rowMap;
+        return lines;
+      },
+    };
+
+    g.__PI_SIDEBAR_PANELS__.set("subagents", panel);
+
     if (typeof g.__PI_SIDEBAR_TUI__?.registerPanel === "function") {
       try {
-        g.__PI_SIDEBAR_TUI__.registerPanel({
-          id: "subagents",
-          order: 15,
-          render: (_ctx: any, width: number) => {
-            if (!this.settings.sidebarEnabled) return [];
-            const items = Array.from(this.active.values());
-            if (items.length === 0) return [];
-
-            const running = items.filter((s) => s.status === "running").length;
-            const completed = items.length - running;
-            const lines: string[] = [];
-
-            const safeW = Math.max(10, width - 2);
-
-            // Styling helpers: prefer sidebar TUI api, then live pi theme, then ansi codes
-            const sidebarAPI = g.__PI_SIDEBAR_TUI__;
-            const fg = (color: string, str: string) => {
-              if (typeof sidebarAPI?.fg === "function") return sidebarAPI.fg(color, str);
-              if (typeof this.theme?.fg === "function") return this.theme.fg(color, str);
-              if (color === "success") return `\x1b[32m${str}\x1b[39m`;
-              if (color === "error") return `\x1b[31m${str}\x1b[39m`;
-              if (color === "accent") return `\x1b[33m${str}\x1b[39m`;
-              if (color === "dim") return `\x1b[2m${str}\x1b[22m`;
-              return str;
-            };
-            const dim = (str: string) => fg("dim", str);
-            const bold = (str: string) => {
-              if (typeof sidebarAPI?.bold === "function") return sidebarAPI.bold(str);
-              if (typeof this.theme?.bold === "function") return this.theme.bold(str);
-              return `\x1b[1m${str}\x1b[22m`;
-            };
-
-            // Synchronize spinner frame with sidebar context if available, otherwise match 90ms clock
-            const currentFrameIndex = _ctx?.spinnerFrame !== undefined
-              ? ((_ctx.spinnerFrame % SPINNER_FRAMES.length) + SPINNER_FRAMES.length) % SPINNER_FRAMES.length
-              : this.getFrameIndex();
-            const currentSpinner = SPINNER_FRAMES[currentFrameIndex];
-
-            // Header line
-            const countLabel = running > 0
-              ? dim(` (${running} active${completed > 0 ? `, ${completed} done` : ""})`)
-              : completed > 0
-                ? fg("success", ` (${completed} done)`)
-                : "";
-            lines.push(bold(" Subagents") + countLabel);
-            lines.push(dim("─".repeat(Math.max(0, safeW))));
-
-            for (const s of items) {
-              const elapsed = (((s.endTime ?? Date.now()) - s.startTime) / 1000).toFixed(1);
-              const title = s.description || (s.task.length > 24 ? `${s.task.slice(0, 21)}...` : s.task);
-
-              if (s.status === "running") {
-                const icon = fg("accent", currentSpinner);
-                lines.push(truncateToWidth(`  ${icon} ${bold(`"${title}"`)} ${dim(`(${elapsed}s)`)}`, safeW));
-                if (s.currentLine) {
-                  const clean = s.currentLine.replace(/[\r\n\t]+/g, " ").trim();
-                  lines.push(truncateToWidth(`    ↳ ${dim(clean)}`, safeW));
-                }
-              } else if (s.status === "completed") {
-                const icon = fg("success", "●");
-                lines.push(truncateToWidth(`  ${icon} "${title}" · ${fg("success", `done in ${elapsed}s`)}`, safeW));
-              } else {
-                const icon = fg("error", "▲");
-                lines.push(truncateToWidth(`  ${icon} ${fg("error", `"${title}"`)} · ${fg("error", `failed`)}`, safeW));
-              }
-            }
-            return lines;
-          },
-        });
+        g.__PI_SIDEBAR_TUI__.registerPanel(panel);
         this.sidebarRegistered = true;
       } catch {}
+    } else {
+      this.sidebarRegistered = true;
     }
   }
 }

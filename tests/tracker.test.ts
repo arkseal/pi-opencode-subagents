@@ -263,4 +263,121 @@ describe("SubagentTracker", () => {
     const cycled3 = tracker.cycleDisplayMode();
     expect(cycled3).toBe("both");
   });
+
+  it("overrides older 'running' entries with newer 'completed' entries for the same ID on restore", () => {
+    const items: any[] = [
+      {
+        id: "bg_sub_1",
+        task: "Background task",
+        status: "running",
+        startTime: 1000,
+        isolated: true,
+        logFile: "/tmp/bg1.log",
+      },
+      {
+        id: "bg_sub_1",
+        task: "Background task",
+        status: "completed",
+        startTime: 1000,
+        endTime: 5000,
+        durationMs: 4000,
+        isolated: true,
+        logFile: "/tmp/bg1.log",
+      },
+    ];
+
+    tracker.restoreRecent(items);
+    const recent = tracker.getRecentList();
+    const found = recent.find((r) => r.id === "bg_sub_1");
+    expect(found).toBeDefined();
+    expect(found?.status).toBe("completed");
+    expect(found?.durationMs).toBe(4000);
+  });
+
+  it("animates braille spinner in sidebar panel for running subagents", () => {
+    let capturedPanel: any = null;
+    (globalThis as any).__PI_SIDEBAR_TUI__ = {
+      registerPanel: (panel: any) => {
+        capturedPanel = panel;
+        return () => {};
+      },
+      unregisterPanel: () => {},
+      fg: (color: string, str: string) => `[${color}]${str}[/${color}]`,
+      bold: (str: string) => `*${str}*`,
+      dim: (str: string) => `~${str}~`,
+    };
+
+    tracker.registerStart({
+      id: "agent-spin",
+      task: "Spinning subagent",
+      isolated: true,
+      logFile: "/tmp/spin.log",
+    });
+
+    expect(capturedPanel).not.toBeNull();
+    const rendered = capturedPanel.render({}, 80);
+    const joined = rendered.join("\n");
+
+    const brailleFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    const containsBraille = brailleFrames.some((frame) => joined.includes(frame));
+    expect(containsBraille).toBe(true);
+
+    delete (globalThis as any).__PI_SIDEBAR_TUI__;
+  });
+
+  it("accurately counts all completed subagents in sidebar header and shows +more indicator when > 5", () => {
+    let capturedPanel: any = null;
+    (globalThis as any).__PI_SIDEBAR_TUI__ = {
+      registerPanel: (panel: any) => {
+        capturedPanel = panel;
+        return () => {};
+      },
+      unregisterPanel: () => {},
+      fg: (color: string, str: string) => `[${color}]${str}[/${color}]`,
+      bold: (str: string) => `*${str}*`,
+      dim: (str: string) => `~${str}~`,
+    };
+
+    // Register 8 subagents
+    for (let i = 1; i <= 8; i++) {
+      tracker.registerStart({
+        id: `agent-count-${i}`,
+        task: `Task ${i}`,
+        isolated: true,
+        logFile: `/tmp/agent-${i}.log`,
+      });
+      tracker.registerFinish(`agent-count-${i}`, {
+        status: "completed",
+        durationMs: 1000 * i,
+      });
+    }
+
+    expect(capturedPanel).not.toBeNull();
+    const rendered = capturedPanel.render({}, 80);
+    const joined = rendered.join("\n");
+
+    // Header MUST show 8 done, not 5!
+    expect(joined).toContain("(8 done)");
+    // Must show clickable View more button
+    expect(joined).toContain("[View 3 more subagents]");
+
+    // Click the button via onClick
+    expect(typeof capturedPanel.onClick).toBe("function");
+    capturedPanel.onClick("[View 3 more subagents]", 10);
+
+    const renderedAll = capturedPanel.render({}, 80).join("\n");
+    expect(renderedAll).toContain("[Show less]");
+    expect(renderedAll).toContain("Task 8");
+    expect(renderedAll).toContain("Task 1");
+
+    // Click on a subagent line to verify it opens the viewer
+    let openedId: string | undefined;
+    tracker.openViewer = async (id?: string) => {
+      openedId = id;
+    };
+    capturedPanel.onClick("Task 8", 2);
+    expect(openedId).toBe("agent-count-8");
+
+    delete (globalThis as any).__PI_SIDEBAR_TUI__;
+  });
 });
