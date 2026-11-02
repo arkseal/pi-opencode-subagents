@@ -65,6 +65,7 @@ export interface TrackedSubagent {
   agent?: string;
   background?: boolean;
   model?: string;
+  reasoning?: string;
   startTime: number;
   endTime?: number;
   durationMs?: number;
@@ -118,7 +119,8 @@ class PinnedSubagentsWidget implements Component {
         const icon = spinner;
         const mode = s.isolated ? this.theme.fg("dim", "[isolated]") : this.theme.fg("warning", "[shared]");
         const bgTag = s.background ? ` ${this.theme.fg("dim", "[bg]")}` : "";
-        const mainLine = `  ${icon} ${this.theme.fg("accent", `[${s.id}]`)}${agentTag} ${this.theme.bold(`"${title}"`)} · ${this.theme.fg("dim", `${elapsedSec}s`)} ${mode}${bgTag}`;
+        const modelBadge = s.model ? ` ${this.theme.fg("dim", `[${s.model}]`)}` : (s.reasoning ? ` ${this.theme.fg("dim", `[reasoning:${s.reasoning}]`)}` : "");
+        const mainLine = `  ${icon} ${this.theme.fg("accent", `[${s.id}]`)}${agentTag} ${this.theme.bold(`"${title}"`)} · ${this.theme.fg("dim", `${elapsedSec}s`)} ${mode}${bgTag}${modelBadge}`;
         lines.push(truncateToWidth(mainLine, boxWidth));
 
         if (s.currentLine) {
@@ -295,6 +297,7 @@ export class SubagentTracker {
     agent?: string;
     background?: boolean;
     model?: string;
+    reasoning?: string;
     isolated: boolean;
     logFile: string;
   }) {
@@ -311,6 +314,7 @@ export class SubagentTracker {
       agent: subagent.agent,
       background: subagent.background,
       model: subagent.model,
+      reasoning: subagent.reasoning,
       startTime: Date.now(),
       status: "running",
       isolated: subagent.isolated,

@@ -83,6 +83,15 @@ export function renderSubagentCall(args: any, theme: any, context: any) {
     content += " " + theme.fg("dim", "[isolated]");
   }
 
+  if (args?.model) {
+    const reasoningSuffix = (args?.reasoning || args?.thinking) && !args.model.includes(":")
+      ? `:${args.reasoning ?? args.thinking}`
+      : "";
+    content += " " + theme.fg("dim", `[${args.model}${reasoningSuffix}]`);
+  } else if (args?.reasoning || args?.thinking) {
+    content += " " + theme.fg("dim", `[reasoning:${args.reasoning ?? args.thinking}]`);
+  }
+
   if (args?.background === false) {
     content += " " + theme.fg("dim", "· blocking");
   } else {
@@ -230,6 +239,15 @@ export class SubagentResultLiveComponent implements Component {
       // Expanded View (full transcript and worktree details)
       outputText += "\n" + this.theme.fg("dim", "─".repeat(Math.min(50, width)));
 
+      const effectiveModel = details.model || liveStats?.model;
+      const effectiveReasoning = details.reasoning || liveStats?.thinkingLevel;
+      if (effectiveModel) {
+        const reasoningSuffix = effectiveReasoning ? ` (${effectiveReasoning} reasoning)` : "";
+        outputText += `\n${this.theme.fg("muted", "Model:")} ${this.theme.fg("accent", effectiveModel)}${this.theme.fg("dim", reasoningSuffix)}`;
+      } else if (effectiveReasoning) {
+        outputText += `\n${this.theme.fg("muted", "Reasoning:")} ${this.theme.fg("dim", effectiveReasoning)}`;
+      }
+
       if (liveStats && (liveStats.totalTokens > 0 || liveStats.toolCalls > 0)) {
         const s = liveStats;
         const formattedParts = [
@@ -251,6 +269,24 @@ export class SubagentResultLiveComponent implements Component {
 
       if (liveLogFile) {
         outputText += `\n${this.theme.fg("muted", "Log File:")} ${this.theme.fg("accent", liveLogFile)}`;
+      }
+
+      outputText += "\n" + this.theme.fg("dim", "─".repeat(Math.min(50, width)));
+
+      let sourceLines: string[] = [];
+      if (liveLogFile && fs.existsSync(liveLogFile)) {
+        try {
+          sourceLines = fs.readFileSync(liveLogFile, "utf-8").split("\n");
+        } catch {
+          sourceLines = cleaned.split("\n");
+        }
+      } else {
+        sourceLines = cleaned.split("\n");
+      }
+
+      const formattedTranscript = formatTranscriptLines(sourceLines, this.theme, Math.max(20, width - 6));
+      for (const line of formattedTranscript) {
+        outputText += `\n${line}`;
       }
     }
 
@@ -316,10 +352,10 @@ export function buildSubagentStatsSummary(items: any[]): { text: string; details
       const tokStr = `${formatTokens(st.tokensIn)} in · ${formatTokens(st.tokensOut)} out${st.cacheRead > 0 ? ` · ${formatTokens(st.cacheRead)} cache` : ""}`;
       const toolStr = st.toolCalls > 0 ? ` · ${st.toolCalls} ${st.toolCalls === 1 ? "tool" : "tools"}` : "";
       const costStr = st.cost && st.cost > 0 ? ` · $${st.cost.toFixed(3)}` : "";
-      lines.push(`• [${s.id}] "${title}" (${s.status}, ${durSec}s)`);
+      lines.push(`• [${s.id}] "${title}" (${s.status}, ${durSec}s)${s.model ? ` [${s.model}]` : ""}`);
       lines.push(`  ↳ ${tokStr}${toolStr}${costStr}`);
     } else {
-      lines.push(`• [${s.id}] "${title}" (${s.status}, ${durSec}s)`);
+      lines.push(`• [${s.id}] "${title}" (${s.status}, ${durSec}s)${s.model ? ` [${s.model}]` : ""}`);
     }
   }
 

@@ -284,4 +284,41 @@ describe("SubagentEventParser", () => {
     expect(stats.cacheRead).toBe(1500);
     expect(stats.totalTokens).toBe(1820);
   });
+
+  it("captures thinkingLevel from message_end and agent_end", () => {
+    const parser = new SubagentEventParser();
+
+    parser.parseLine(
+      JSON.stringify({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          model: "gemini-3.8-flash",
+          thinkingLevel: "high",
+          usage: { input: 100, output: 50 },
+        },
+      })
+    );
+
+    expect(parser.getStats().model).toBe("gemini-3.8-flash");
+    expect(parser.getStats().thinkingLevel).toBe("high");
+
+    const fallbackParser = new SubagentEventParser();
+    fallbackParser.parseLine(
+      JSON.stringify({
+        type: "agent_end",
+        messages: [
+          {
+            role: "assistant",
+            model: "claude-sonnet-4",
+            thinkingLevel: "medium",
+            usage: { input: 200, output: 100 },
+          },
+        ],
+      })
+    );
+
+    expect(fallbackParser.getStats().model).toBe("claude-sonnet-4");
+    expect(fallbackParser.getStats().thinkingLevel).toBe("medium");
+  });
 });

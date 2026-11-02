@@ -8,6 +8,7 @@ export interface SubagentStats {
   turns: number;
   toolCalls: number;
   model?: string;
+  thinkingLevel?: string;
 }
 
 export interface ParsedEventPeek {
@@ -110,12 +111,14 @@ export class SubagentEventParser {
         if (ev.message?.role === "assistant") {
           this.currentTurnUsage = undefined;
           if (ev.message?.model) this.stats.model = ev.message.model;
+          if (ev.message?.thinkingLevel) this.stats.thinkingLevel = ev.message.thinkingLevel;
         }
       }
 
       if (ev.type === "message_end") {
         if (ev.message?.role === "assistant") {
           if (ev.message?.model) this.stats.model = ev.message.model;
+          if (ev.message?.thinkingLevel) this.stats.thinkingLevel = ev.message.thinkingLevel;
           const usage = ev.message?.usage || this.currentTurnUsage;
           if (usage) {
             this.stats.tokensIn += usage.input ?? 0;
@@ -142,6 +145,7 @@ export class SubagentEventParser {
           for (const msg of ev.messages) {
             if (msg.role === "assistant" && msg.usage) {
               if (msg.model && !this.stats.model) this.stats.model = msg.model;
+              if (msg.thinkingLevel && !this.stats.thinkingLevel) this.stats.thinkingLevel = msg.thinkingLevel;
               this.stats.tokensIn += msg.usage.input ?? 0;
               this.stats.tokensOut += msg.usage.output ?? 0;
               this.stats.cacheRead += msg.usage.cacheRead ?? 0;

@@ -1,6 +1,14 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { executeSubagent, getSubagentDir, getSubagentSessionsDir, stopSubagent, stopAllSubagents } from "./runner.js";
+import {
+  executeSubagent,
+  getSubagentDir,
+  getSubagentSessionsDir,
+  stopSubagent,
+  stopAllSubagents,
+  buildPiArgs,
+  type SubagentModelOption,
+} from "./runner.js";
 import {
   renderSubagentCall,
   renderSubagentResult,
@@ -26,7 +34,15 @@ import {
   type AgentProfile,
 } from "./agents.js";
 
-export { executeSubagent, getSubagentDir, getSubagentSessionsDir, stopSubagent, stopAllSubagents } from "./runner.js";
+export {
+  executeSubagent,
+  getSubagentDir,
+  getSubagentSessionsDir,
+  stopSubagent,
+  stopAllSubagents,
+  buildPiArgs,
+  type SubagentModelOption,
+} from "./runner.js";
 export { createWorktree, cleanupWorktree } from "./worktree.js";
 export { formatTaskResultEnvelope, formatSubagentEnvelope } from "./envelope.js";
 export { checkSubagentDepth, setMaxDepth } from "./depth-guard.js";
@@ -255,6 +271,7 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
       "Dispatch multiple subagent calls in parallel within a single turn for independent tasks.",
       "Use agent='explore' for read-only codebase exploration, keyword search, or file inspection.",
       "Pass sessionID to continue an existing child conversation instead of starting from scratch.",
+      "Optionally configure a specific model or reasoning effort for subagents depending on task complexity.",
     ],
     parameters: Type.Object(
       {
@@ -291,16 +308,28 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
               "Run the subagent in the background without blocking the main chat (default true). Set to false to block until complete.",
           })
         ),
-        model: Type.Optional(
-          Type.String({
-            description:
-              "Optional model override for this subagent (e.g. 'providerID/modelID' or model name).",
-          })
-        ),
         isolated: Type.Optional(
           Type.Boolean({
             description:
               "Run in an isolated Git worktree (default true). Keeps working tree clean from experimental edits.",
+          })
+        ),
+        model: Type.Optional(
+          Type.String({
+            description:
+              "Optional model to use for the subagent (e.g. 'openai/gpt-4o', 'claude-sonnet', or 'claude-sonnet:high'). Supports ':thinking' suffix to set reasoning.",
+          })
+        ),
+        reasoning: Type.Optional(
+          Type.String({
+            description:
+              "Optional reasoning effort or thinking level for the subagent (e.g. 'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max').",
+          })
+        ),
+        thinking: Type.Optional(
+          Type.String({
+            description:
+              "Alias for reasoning. Set thinking level for the subagent (e.g. 'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max').",
           })
         ),
       },
@@ -321,9 +350,11 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
         description: params.description,
         sessionID: params.sessionID,
         background: isBackground,
-        model: params.model,
         cwd: ctx.cwd,
         isolated: params.isolated ?? true,
+        model: params.model,
+        reasoning: params.reasoning ?? params.thinking,
+        thinking: params.thinking,
         currentDepth: depth,
         signal,
         onUpdate,
@@ -335,8 +366,11 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
               ctx.sessionManager.appendCustomEntry("subagent_record", {
                 id: bgResult.id,
                 sessionID: bgResult.sessionID,
+                agent: params.agent,
                 task,
                 description: params.description,
+                model: (bgResult as any).model ?? params.model,
+                reasoning: (bgResult as any).reasoning ?? (params.reasoning ?? params.thinking),
                 startTime: Date.now() - (bgResult.durationMs ?? 0),
                 endTime: Date.now(),
                 durationMs: bgResult.durationMs,
@@ -359,6 +393,8 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
                 status: bgResult.status as any,
                 durationMs: bgResult.durationMs,
                 summary: bgResult.summary,
+                model: (bgResult as any).model ?? params.model,
+                reasoning: (bgResult as any).reasoning ?? (params.reasoning ?? params.thinking),
                 stats: bgResult.stats,
                 logFilePath: (bgResult as any).logFile,
               });
@@ -377,6 +413,8 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
                       durationMs: bgResult.durationMs,
                       summary: bgResult.summary,
                       stats: bgResult.stats,
+                      model: (bgResult as any).model ?? params.model,
+                      reasoning: (bgResult as any).reasoning ?? (params.reasoning ?? params.thinking),
                       logFile: (bgResult as any).logFile,
                       task,
                       description: params.description,
@@ -426,6 +464,8 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
               agent: result.details.agent,
               task: result.details.task,
               description: result.details.description,
+              model: result.details.model,
+              reasoning: result.details.reasoning,
               startTime: Date.now() - (result.details.durationMs ?? 0),
               endTime: Date.now(),
               durationMs: result.details.durationMs,

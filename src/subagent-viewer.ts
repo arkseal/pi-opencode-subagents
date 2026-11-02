@@ -1079,9 +1079,13 @@ export class SubagentViewer implements Component {
     statsParts.push(`Agent: ${agent}`);
     const statsLeft = this.theme.fg("dim", statsParts.join(" "));
 
+    const effectiveModel = sub?.model || sub?.stats?.model;
+    const effectiveReasoning = sub?.reasoning || sub?.stats?.thinkingLevel;
     const modelInfo =
-      this.sessionModelInfo || parseModelAndReasoning(sub?.model || "antigravity/gemini-3.8-flash:low");
-    const reasoningStr = modelInfo.reasoning ? ` • ${modelInfo.reasoning}` : "";
+      this.sessionModelInfo || parseModelAndReasoning(effectiveModel || "antigravity/gemini-3.8-flash:low");
+    const reasoningStr = (effectiveReasoning || modelInfo.reasoning)
+      ? ` • ${effectiveReasoning || modelInfo.reasoning}`
+      : "";
     const rightSide = this.theme.fg("dim", `(${modelInfo.provider}) ${modelInfo.model}${reasoningStr}`);
 
     const statsLeftWidth = visibleWidth(statsLeft);

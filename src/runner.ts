@@ -67,6 +67,33 @@ export function getSubagentSessionsDir(): string {
   return sessionsDir;
 }
 
+export type SubagentModelOption =
+  | string
+  | {
+      name?: string;
+      model?: string;
+      reasoning?: string;
+      thinking?: string;
+    };
+
+export function buildPiArgs(options: {
+  task: string;
+  model?: string;
+  reasoning?: string;
+  thinking?: string;
+}): string[] {
+  const args = ["--mode", "json", "-p", "--no-session"];
+  if (options.model) {
+    args.push("--model", options.model);
+  }
+  const thinking = options.reasoning ?? options.thinking;
+  if (thinking) {
+    args.push("--thinking", thinking);
+  }
+  args.push("-a", options.task);
+  return args;
+}
+
 export interface SpawnSubagentOptions {
   task?: string;
   prompt?: string; // alias for task
@@ -74,10 +101,9 @@ export interface SpawnSubagentOptions {
   agent?: string; // specialized agent (default "general", or "explore", etc.)
   sessionID?: string; // continue a previous child session
   background?: boolean; // background async execution (defaults to true)
-  model?: string; // model override
-  cwd: string;
-  isolated?: boolean; // defaults to true
-  currentDepth?: number; // defaults to 0
+  model?: SubagentModelOption;
+  reasoning?: string;
+  thinking?: string;
   onUpdate?: (update: { content: Array<{ type: "text"; text: string }>; details: any }) => void;
   signal?: AbortSignal;
   uiContext?: any;
@@ -104,8 +130,18 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
   const logFile = path.join(subagentDir, `${id}.log`);
   const startTime = Date.now();
 
+  let modelName: string | undefined;
+  let modelReasoning: string | undefined;
+  if (typeof options.model === "string") {
+    modelName = options.model;
+  } else if (typeof options.model === "object" && options.model !== null) {
+    modelName = options.model.name || options.model.model;
+    modelReasoning = options.model.reasoning || options.model.thinking;
+  }
+  const thinking = options.reasoning ?? options.thinking ?? modelReasoning;
+
   const agentProfile: AgentProfile = await resolveAgent(options.agent, options.cwd);
-  const effectiveModel = options.model ?? agentProfile.model;
+  const effectiveModel = modelName ?? agentProfile.model;
 
   const isolated = options.isolated ?? true;
   let workDir = options.cwd;
@@ -135,6 +171,11 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
   // Model override
   if (effectiveModel) {
     args.push("--model", effectiveModel);
+  }
+
+  // Thinking / reasoning level
+  if (thinking) {
+    args.push("--thinking", thinking);
   }
 
   // Inject agent system prompt
@@ -229,6 +270,7 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
       agent: agentProfile.id,
       background: true,
       model: effectiveModel,
+      reasoning: thinking,
       isolated,
       logFile,
     });
@@ -290,6 +332,8 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
           durationMs,
           summary,
           stats,
+          model: effectiveModel,
+          reasoning: thinking,
           logFile,
           worktree: worktreeInfo
             ? {
@@ -329,6 +373,7 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
         logFile,
         isolated,
         model: effectiveModel,
+        reasoning: thinking,
       },
     };
   }
@@ -342,6 +387,7 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
     agent: agentProfile.id,
     background: false,
     model: effectiveModel,
+    reasoning: thinking,
     isolated,
     logFile,
   });
@@ -355,6 +401,8 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
         agent: agentProfile.id,
         task: taskText,
         description: options.description,
+        model: modelName,
+        reasoning: thinking,
         status: "running",
         elapsedMs: Date.now() - startTime,
         currentLine: lastLine,
@@ -419,6 +467,8 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
     durationMs,
     summary,
     logFilePath: logFile,
+    model: effectiveModel,
+    reasoning: thinking,
     stats,
   });
 
@@ -430,6 +480,8 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
       agent: agentProfile.id,
       task: taskText,
       description: options.description,
+      model: effectiveModel,
+      reasoning: thinking,
       status,
       exitCode,
       durationMs,
