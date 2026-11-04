@@ -56,8 +56,8 @@ export function cleanSubagentOutput(raw: string): string {
   // Strip </task-result> and </subagent> closing tags
   text = text.replace(/\s*<\/(?:task-result|subagent)>/gi, "");
 
-  // Strip "Full transcript: ..." trailing line if present
-  text = text.replace(/Full transcript:\s*\/[^\n]+/gi, "");
+  // Strip "Full transcript: ..." trailing line if present (supporting Unix, Windows, and relative paths)
+  text = text.replace(/Full transcript:\s*[^\n]+/gi, "");
 
   return text.trim();
 }
@@ -229,10 +229,13 @@ export class SubagentResultLiveComponent implements Component {
           outputText += `\n  ${this.theme.fg("muted", "│")} ${this.theme.fg("toolOutput", line)}`;
         }
         const totalLines = cleaned.split("\n").length;
+        const expandHint = typeof this.context?.keyHint === "function"
+          ? this.context.keyHint("app.tools.expand", "to expand")
+          : "ctrl+o to expand";
         if (totalLines > 4) {
-          outputText += `\n  ${this.theme.fg("muted", "│")} ${this.theme.fg("dim", `... (${totalLines - 4} more lines · ctrl+o to expand)`)}`;
+          outputText += `\n  ${this.theme.fg("muted", "│")} ${this.theme.fg("dim", `... (${totalLines - 4} more lines · ${expandHint})`)}`;
         } else {
-          outputText += `\n  ${this.theme.fg("dim", "(ctrl+o to expand)")}`;
+          outputText += `\n  ${this.theme.fg("dim", `(${expandHint})`)}`;
         }
       }
     } else {
@@ -426,14 +429,17 @@ export function renderSubagentResponseMessage(
 
   if (!isExpanded) {
     // Compact preview: show up to 3 lines with gutter │
+    const expandHint = typeof (options as any)?.keyHint === "function"
+      ? (options as any).keyHint("app.tools.expand", "to expand")
+      : "ctrl+o to expand";
     const preview = textLines.slice(0, 3);
     for (const l of preview) {
       lines.push(`  ${theme.fg("muted", "│")} ${theme.fg("toolOutput", truncateToWidth(l, 80))}`);
     }
     if (textLines.length > 3) {
-      lines.push(`  ${theme.fg("muted", "│")} ${theme.fg("dim", `... (${textLines.length - 3} more lines · ctrl+o to expand)`)}`);
+      lines.push(`  ${theme.fg("muted", "│")} ${theme.fg("dim", `... (${textLines.length - 3} more lines · ${expandHint})`)}`);
     } else {
-      lines.push(`  ${theme.fg("muted", "│")} ${theme.fg("dim", `(ctrl+o to expand full transcript)`)}`);
+      lines.push(`  ${theme.fg("muted", "│")} ${theme.fg("dim", `(${expandHint} full transcript)`)}`);
     }
   } else {
     // Expanded view: full response

@@ -44,6 +44,17 @@ Full transcript: /tmp/pi-subagents/subagent_xyz.log
     expect(cleaned).toContain("Discovered 3 route definitions in src/routes.");
   });
 
+  it("strips Windows-style transcript paths cleanly", () => {
+    const raw = `<subagent sessionID="win_sub" state="completed">
+Summary of windows execution.
+Full transcript: C:\\Users\\Tester\\.pi\\agent\\subagents\\win_sub.log
+</subagent>`;
+
+    const cleaned = cleanSubagentOutput(raw);
+    expect(cleaned).not.toContain("Full transcript:");
+    expect(cleaned).toContain("Summary of windows execution.");
+  });
+
   it("handles empty or plain text cleanly", () => {
     expect(cleanSubagentOutput("")).toBe("");
     expect(cleanSubagentOutput("Plain text without xml")).toBe("Plain text without xml");
@@ -414,6 +425,30 @@ describe("renderSubagentResponseMessage", () => {
     expect(rendered).toContain("ctrl+o to expand");
     // Should NOT show line 5 in compact 3-line preview
     expect(rendered).not.toContain("Line 5");
+  });
+
+  it("respects custom keyHint in compact preview", () => {
+    const message = {
+      content: "First\nSecond\nThird\nFourth\nFifth",
+      details: {
+        id: "sub_hint",
+        status: "completed",
+        durationMs: 1000,
+      },
+    };
+
+    const component: any = renderSubagentResponseMessage(
+      message,
+      {
+        expanded: false,
+        keyHint: (id: string, desc: string) => `[${id} -> ${desc}]`,
+      } as any,
+      mockTheme
+    );
+    const textChild = component.children?.[0];
+    const rendered = textChild?.text || "";
+
+    expect(rendered).toContain("[app.tools.expand -> to expand]");
   });
 
   it("renders full output when expanded is true", () => {

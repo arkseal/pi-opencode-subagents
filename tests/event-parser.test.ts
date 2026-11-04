@@ -321,4 +321,32 @@ describe("SubagentEventParser", () => {
     expect(fallbackParser.getStats().model).toBe("claude-sonnet-4");
     expect(fallbackParser.getStats().thinkingLevel).toBe("medium");
   });
+
+  it("resets statistics and pending calls cleanly", () => {
+    const parser = new SubagentEventParser();
+    parser.parseLine(
+      JSON.stringify({
+        type: "tool_execution_start",
+        toolCallId: "call_1",
+        toolName: "bash",
+        args: { command: "echo 1" },
+      })
+    );
+    parser.parseLine(
+      JSON.stringify({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          usage: { input: 100, output: 50 },
+        },
+      })
+    );
+
+    expect(parser.getStats().toolCalls).toBe(1);
+    expect(parser.getStats().totalTokens).toBe(150);
+
+    parser.reset();
+    expect(parser.getStats().toolCalls).toBe(0);
+    expect(parser.getStats().totalTokens).toBe(0);
+  });
 });

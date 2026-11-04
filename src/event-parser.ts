@@ -39,6 +39,21 @@ export class SubagentEventParser {
   };
   private currentTurnUsage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; cost?: { total?: number } };
 
+  reset(): void {
+    this.pendingCalls.clear();
+    this.currentTurnUsage = undefined;
+    this.stats = {
+      tokensIn: 0,
+      tokensOut: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: 0,
+      turns: 0,
+      toolCalls: 0,
+    };
+  }
+
   parseLine(line: string): ParsedEventPeek | undefined {
     const trimmed = line.trim();
     if (!trimmed || !trimmed.startsWith("{")) return undefined;
@@ -141,6 +156,8 @@ export class SubagentEventParser {
 
       // 6. Agent ended (capture final assistant response & fallback token counting)
       if (ev.type === "agent_end" && Array.isArray(ev.messages)) {
+        this.pendingCalls.clear();
+        this.currentTurnUsage = undefined;
         if (this.stats.totalTokens === 0) {
           for (const msg of ev.messages) {
             if (msg.role === "assistant" && msg.usage) {
