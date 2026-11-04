@@ -9,9 +9,10 @@ export function setMaxDepth(depth: number): void {
 }
 
 export function checkSubagentDepth(currentDepth: number): void {
-  if (currentDepth >= currentMaxDepth) {
+  const depth = Number.isFinite(currentDepth) ? currentDepth : 0;
+  if (depth >= currentMaxDepth) {
     throw new Error(
-      `Recursion depth limit reached (current: ${currentDepth}, max: ${currentMaxDepth}). Subagents are not permitted to spawn nested subagents.`
+      `Recursion depth limit reached (current: ${depth}, max: ${currentMaxDepth}). Subagents are not permitted to spawn nested subagents.`
     );
   }
 }

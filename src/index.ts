@@ -82,6 +82,14 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
     isAgentActive = false;
   });
 
+  pi.on("agent_settled", () => {
+    isAgentActive = false;
+  });
+
+  pi.on("session_shutdown", async () => {
+    stopAllSubagents();
+  });
+
   // Capture UI context and restore subagents on session lifecycle
   pi.on("session_start", async (_event, ctx) => {
     globalSubagentTracker.setUIContext(ctx);
@@ -339,8 +347,12 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
     renderResult: renderSubagentResult,
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       globalSubagentTracker.setUIContext(ctx);
-      const depth = parseInt(process.env.PI_SUBAGENT_DEPTH ?? "0", 10);
-      const task = params.task || params.prompt || "";
+      const rawDepth = parseInt(process.env.PI_SUBAGENT_DEPTH ?? "0", 10);
+      const depth = Number.isFinite(rawDepth) ? rawDepth : 0;
+      const task = (params.task || params.prompt || "").trim();
+      if (!task) {
+        throw new Error("A task or prompt must be specified for the subagent.");
+      }
       const isBackground = params.background !== false;
 
       const result = await executeSubagent({
@@ -362,24 +374,27 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
         onBackgroundComplete: (bgResult) => {
           // Deliver completion record to session JSONL
           try {
-            if (ctx.sessionManager && typeof ctx.sessionManager.appendCustomEntry === "function") {
-              ctx.sessionManager.appendCustomEntry("subagent_record", {
-                id: bgResult.id,
-                sessionID: bgResult.sessionID,
-                agent: params.agent,
-                task,
-                description: params.description,
-                model: (bgResult as any).model ?? params.model,
-                reasoning: (bgResult as any).reasoning ?? (params.reasoning ?? params.thinking),
-                startTime: Date.now() - (bgResult.durationMs ?? 0),
-                endTime: Date.now(),
-                durationMs: bgResult.durationMs,
-                status: bgResult.status,
-                isolated: params.isolated ?? true,
-                logFile: (bgResult as any).logFile,
-                currentLine: "Done",
-                stats: bgResult.stats,
-              });
+            const record = {
+              id: bgResult.id,
+              sessionID: bgResult.sessionID,
+              agent: params.agent,
+              task,
+              description: params.description,
+              model: (bgResult as any).model ?? params.model,
+              reasoning: (bgResult as any).reasoning ?? (params.reasoning ?? params.thinking),
+              startTime: Date.now() - (bgResult.durationMs ?? 0),
+              endTime: Date.now(),
+              durationMs: bgResult.durationMs,
+              status: bgResult.status,
+              isolated: (bgResult as any).isolated ?? params.isolated ?? true,
+              logFile: (bgResult as any).logFile,
+              currentLine: "Done",
+              stats: bgResult.stats,
+            };
+            if (typeof (pi as any).appendEntry === "function") {
+              (pi as any).appendEntry("subagent_record", record);
+            } else if (ctx.sessionManager && typeof (ctx.sessionManager as any).appendCustomEntry === "function") {
+              (ctx.sessionManager as any).appendCustomEntry("subagent_record", record);
             }
           } catch {}
 
@@ -457,25 +472,28 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
       // Persist completed subagent metadata to session JSONL so it survives session exit and rejoin
       if (!isBackground) {
         try {
-          if (ctx.sessionManager && typeof ctx.sessionManager.appendCustomEntry === "function") {
-            ctx.sessionManager.appendCustomEntry("subagent_record", {
-              id: result.details.id,
-              sessionID: result.details.sessionID,
-              agent: result.details.agent,
-              task: result.details.task,
-              description: result.details.description,
-              model: result.details.model,
-              reasoning: result.details.reasoning,
-              startTime: Date.now() - (result.details.durationMs ?? 0),
-              endTime: Date.now(),
-              durationMs: result.details.durationMs,
-              status: result.details.status,
-              isolated: result.details.isolated,
-              logFile: result.details.logFile,
-              exitCode: result.details.exitCode,
-              currentLine: "Done",
-              stats: result.details.stats,
-            });
+          const record = {
+            id: result.details.id,
+            sessionID: result.details.sessionID,
+            agent: result.details.agent,
+            task: result.details.task,
+            description: result.details.description,
+            model: result.details.model,
+            reasoning: result.details.reasoning,
+            startTime: Date.now() - (result.details.durationMs ?? 0),
+            endTime: Date.now(),
+            durationMs: result.details.durationMs,
+            status: result.details.status,
+            isolated: result.details.isolated,
+            logFile: result.details.logFile,
+            exitCode: result.details.exitCode,
+            currentLine: "Done",
+            stats: result.details.stats,
+          };
+          if (typeof (pi as any).appendEntry === "function") {
+            (pi as any).appendEntry("subagent_record", record);
+          } else if (ctx.sessionManager && typeof (ctx.sessionManager as any).appendCustomEntry === "function") {
+            (ctx.sessionManager as any).appendCustomEntry("subagent_record", record);
           }
         } catch {}
       }
