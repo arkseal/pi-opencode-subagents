@@ -32,12 +32,22 @@ export async function createWorktree(
     const isGit = await git(repoRoot, ["rev-parse", "--is-inside-work-tree"]);
     if (isGit !== "true") return undefined;
 
-    const baseSha = await git(repoRoot, ["rev-parse", "HEAD"]);
+    const actualRoot = await git(repoRoot, ["rev-parse", "--show-toplevel"]);
+
+    // Check if HEAD exists (empty repo check)
+    let baseSha: string;
+    try {
+      baseSha = await git(actualRoot, ["rev-parse", "HEAD"]);
+    } catch {
+      // Empty repo with no commits yet - cannot create worktree from HEAD
+      return undefined;
+    }
+
     const branch = `subagent/${agentId}-${randomUUID().slice(0, 6)}`;
     const worktreePath = path.join(os.tmpdir(), "pi-worktrees", `${agentId}-${randomUUID().slice(0, 6)}`);
 
     await fs.mkdir(path.dirname(worktreePath), { recursive: true });
-    await git(repoRoot, ["worktree", "add", "--detach", worktreePath, "HEAD"]);
+    await git(actualRoot, ["worktree", "add", "--detach", worktreePath, "HEAD"]);
 
     return { path: worktreePath, branch, baseSha };
   } catch {
@@ -51,21 +61,38 @@ export async function cleanupWorktree(
   commitMessage: string
 ): Promise<WorktreeCleanupResult> {
   let hasChanges = false;
+  let root = repoRoot;
+  try {
+    root = await git(repoRoot, ["rev-parse", "--show-toplevel"]);
+  } catch {}
+
   try {
     const status = await git(info.path, ["status", "--porcelain"]);
     if (status.length > 0) {
       hasChanges = true;
       await git(info.path, ["add", "-A"]);
-      await git(info.path, ["commit", "-m", `subagent: ${commitMessage.slice(0, 120)}`]);
-      await git(info.path, ["branch", info.branch]);
+      const safeMsg = commitMessage.trim()
+        ? commitMessage.replace(/[\r\n]+/g, " ").slice(0, 120)
+        : "automated changes";
+      await git(info.path, [
+        "-c",
+        "user.name=Pi Subagent",
+        "-c",
+        "user.email=subagent@pi.local",
+        "commit",
+        "--no-verify",
+        "-m",
+        `subagent: ${safeMsg}`,
+      ]);
+      await git(info.path, ["branch", "-f", info.branch]);
     }
 
-    await git(repoRoot, ["worktree", "remove", "--force", info.path]);
-    await git(repoRoot, ["worktree", "prune"]);
+    await git(root, ["worktree", "remove", "--force", info.path]);
+    await git(root, ["worktree", "prune"]);
   } catch {
     try {
       await fs.rm(info.path, { recursive: true, force: true });
-      await git(repoRoot, ["worktree", "prune"]);
+      await git(root, ["worktree", "prune"]);
     } catch {}
   }
 
