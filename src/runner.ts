@@ -4,38 +4,112 @@ import * as fsSync from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { randomUUID } from "node:crypto";
-import { createWorktree, cleanupWorktree } from "./worktree.js";
+import { createWorktree, cleanupWorktree, type WorktreeInfo } from "./worktree.js";
 import { formatSubagentEnvelope } from "./envelope.js";
 import { checkSubagentDepth } from "./depth-guard.js";
 import { globalSubagentTracker } from "./tracker.js";
 import { SubagentEventParser } from "./event-parser.js";
 import { resolveAgent, type AgentProfile } from "./agents.js";
 
+export interface ActiveSubagentHandle {
+  id: string;
+  child: ChildProcess;
+  worktreeInfo?: WorktreeInfo;
+  cwd: string;
+  taskText: string;
+  logFd?: number;
+  logFile: string;
+  abortHandler?: () => void;
+  signal?: AbortSignal;
+  isAborted?: boolean;
+}
+
+export const activeSubagentHandles = new Map<string, ActiveSubagentHandle>();
 export const activeSubagentProcesses = new Map<string, ChildProcess>();
 
-export function stopSubagent(id: string): boolean {
-  const child = activeSubagentProcesses.get(id);
-  if (child) {
-    try {
+export function killProcessGroup(child: ChildProcess): void {
+  if (!child || child.killed) return;
+  const pid = child.pid;
+  if (!pid) return;
+
+  try {
+    if (process.platform !== "win32") {
+      try {
+        process.kill(-pid, "SIGTERM");
+      } catch {
+        child.kill("SIGTERM");
+      }
+    } else {
       child.kill("SIGTERM");
+    }
+  } catch {}
+
+  const killTimeout = setTimeout(() => {
+    try {
+      if (!child.killed) {
+        if (process.platform !== "win32") {
+          try {
+            process.kill(-pid, "SIGKILL");
+          } catch {
+            child.kill("SIGKILL");
+          }
+        } else {
+          child.kill("SIGKILL");
+        }
+      }
     } catch {}
-    activeSubagentProcesses.delete(id);
-    globalSubagentTracker.registerFinish(id, { status: "aborted", exitCode: 130 });
-    return true;
+  }, 2000);
+
+  child.once("close", () => {
+    clearTimeout(killTimeout);
+  });
+  if (typeof killTimeout.unref === "function") {
+    killTimeout.unref();
   }
-  return false;
+}
+
+export function stopSubagent(id: string): boolean {
+  const handle = activeSubagentHandles.get(id);
+  const child = handle?.child ?? activeSubagentProcesses.get(id);
+  if (!child && !handle) return false;
+
+  if (handle) {
+    handle.isAborted = true;
+    if (handle.signal && handle.abortHandler) {
+      handle.signal.removeEventListener("abort", handle.abortHandler);
+    }
+    if (handle.logFd !== undefined) {
+      try {
+        fsSync.closeSync(handle.logFd);
+      } catch {}
+      handle.logFd = undefined;
+    }
+    if (handle.worktreeInfo) {
+      void cleanupWorktree(handle.cwd, handle.worktreeInfo, "aborted subagent").catch(() => {});
+      handle.worktreeInfo = undefined;
+    }
+  }
+
+  if (child) {
+    killProcessGroup(child);
+  }
+
+  activeSubagentProcesses.delete(id);
+  activeSubagentHandles.delete(id);
+  globalSubagentTracker.registerFinish(id, { status: "aborted", exitCode: 130 });
+  return true;
 }
 
 export function stopAllSubagents(): number {
   let count = 0;
-  for (const [id, child] of activeSubagentProcesses.entries()) {
-    try {
-      child.kill("SIGTERM");
-    } catch {}
-    globalSubagentTracker.registerFinish(id, { status: "aborted", exitCode: 130 });
-    count++;
+  const allIds = Array.from(new Set([...activeSubagentHandles.keys(), ...activeSubagentProcesses.keys()]));
+  for (const id of allIds) {
+    if (stopSubagent(id)) {
+      count++;
+    }
   }
   activeSubagentProcesses.clear();
+  activeSubagentHandles.clear();
   globalSubagentTracker.stopAll();
   return count;
 }
@@ -143,18 +217,51 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
   const agentProfile: AgentProfile = await resolveAgent(options.agent, options.cwd);
   const effectiveModel = modelName ?? agentProfile.model;
 
-  const isolated = options.isolated ?? true;
-  let workDir = options.cwd;
-  let worktreeInfo;
+  // Immediate abort check before allocating worktree or log file
+  if (options.signal?.aborted) {
+    const envelope = formatSubagentEnvelope({
+      id,
+      sessionID: id,
+      status: "aborted",
+      durationMs: 0,
+      summary: "Subagent aborted before execution.",
+      logFilePath: logFile,
+      model: effectiveModel,
+      reasoning: thinking,
+    });
+    return {
+      output: envelope,
+      details: {
+        id,
+        sessionID: id,
+        agent: agentProfile.id,
+        task: taskText,
+        description: options.description,
+        model: effectiveModel,
+        reasoning: thinking,
+        status: "aborted",
+        exitCode: 130,
+        durationMs: 0,
+        logFile,
+        isolated: false,
+        summary: "Subagent aborted before execution.",
+      },
+    };
+  }
 
-  if (isolated) {
+  const isolatedRequested = options.isolated ?? true;
+  let workDir = options.cwd;
+  let worktreeInfo: WorktreeInfo | undefined;
+
+  if (isolatedRequested) {
     worktreeInfo = await createWorktree(options.cwd, id);
     if (worktreeInfo) {
       workDir = worktreeInfo.path;
     }
   }
 
-  const logFd = fsSync.openSync(logFile, "a");
+  const actuallyIsolated = Boolean(worktreeInfo);
+  let logFd: number | undefined = fsSync.openSync(logFile, "a");
 
   let lastLine = "";
   let aborted = false;
@@ -207,20 +314,51 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
     stdio: ["ignore", "pipe", "pipe"],
   });
 
+  const handle: ActiveSubagentHandle = {
+    id,
+    child,
+    worktreeInfo,
+    cwd: options.cwd,
+    taskText,
+    logFd,
+    logFile,
+    signal: options.signal,
+  };
+
   activeSubagentProcesses.set(id, child);
+  activeSubagentHandles.set(id, handle);
+
+  const abortHandler = () => {
+    aborted = true;
+    handle.isAborted = true;
+    killProcessGroup(child);
+  };
+  handle.abortHandler = abortHandler;
 
   if (options.signal) {
-    options.signal.addEventListener(
-      "abort",
-      () => {
-        aborted = true;
-        try {
-          child.kill("SIGTERM");
-        } catch {}
-      },
-      { once: true }
-    );
+    options.signal.addEventListener("abort", abortHandler, { once: true });
   }
+
+  const flushLineBuffer = () => {
+    if (!lineBuffer.trim()) {
+      lineBuffer = "";
+      return;
+    }
+    const parsed = parser.parseLine(lineBuffer);
+    if (parsed) {
+      if (parsed.finalAssistantText) lastAssistantText = parsed.finalAssistantText;
+      if (logFd !== undefined && parsed.transcriptLine) {
+        try {
+          fsSync.writeSync(logFd, `${parsed.transcriptLine}\n`);
+        } catch {}
+      }
+    } else if (logFd !== undefined && !lineBuffer.startsWith("{")) {
+      try {
+        fsSync.writeSync(logFd, `${lineBuffer}\n`);
+      } catch {}
+    }
+    lineBuffer = "";
+  };
 
   const handleChunk = (chunk: Buffer) => {
     const text = chunk.toString("utf-8");
@@ -237,7 +375,7 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
           lastLine = parsed.peek;
           globalSubagentTracker.updatePeek(id, lastLine, parsed.priority, parsed.lingerMs);
         }
-        if (parsed.transcriptLine) {
+        if (parsed.transcriptLine && logFd !== undefined) {
           try {
             fsSync.writeSync(logFd, `${parsed.transcriptLine}\n`);
           } catch {}
@@ -249,9 +387,11 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
         const clean = line.replace(/[\r\n\t]+/g, " ").trim();
         lastLine = clean;
         globalSubagentTracker.updatePeek(id, lastLine, "normal", 1000);
-        try {
-          fsSync.writeSync(logFd, `${line}\n`);
-        } catch {}
+        if (logFd !== undefined) {
+          try {
+            fsSync.writeSync(logFd, `${line}\n`);
+          } catch {}
+        }
       }
     }
   };
@@ -271,7 +411,7 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
       background: true,
       model: effectiveModel,
       reasoning: thinking,
-      isolated,
+      isolated: actuallyIsolated,
       logFile,
     });
 
@@ -279,10 +419,23 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
     const finishOnce = async (code: number) => {
       if (finished) return;
       finished = true;
+
+      if (options.signal && abortHandler) {
+        options.signal.removeEventListener("abort", abortHandler);
+      }
+
       activeSubagentProcesses.delete(id);
-      try {
-        fsSync.closeSync(logFd);
-      } catch {}
+      activeSubagentHandles.delete(id);
+
+      flushLineBuffer();
+
+      if (logFd !== undefined) {
+        try {
+          fsSync.closeSync(logFd);
+        } catch {}
+        logFd = undefined;
+        handle.logFd = undefined;
+      }
 
       const durationMs = Date.now() - startTime;
       let summary = lastAssistantText;
@@ -300,16 +453,18 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
       if (worktreeInfo) {
         try {
           cleanupDetails = await cleanupWorktree(options.cwd, worktreeInfo, taskText);
+          handle.worktreeInfo = undefined;
         } catch {}
       }
 
-      const status = aborted ? "aborted" : code === 0 ? "completed" : "failed";
+      const isSubagentAborted = aborted || handle.isAborted;
+      const status = isSubagentAborted ? "aborted" : code === 0 ? "completed" : "failed";
       const stats = parser.getStats();
 
       try {
         globalSubagentTracker.registerFinish(id, {
           status,
-          exitCode: code,
+          exitCode: isSubagentAborted ? 130 : code,
           durationMs,
           stats,
         });
@@ -346,9 +501,6 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
       } catch {}
     };
 
-    child.on("exit", (code) => {
-      void finishOnce(code ?? 0);
-    });
     child.on("close", (code) => {
       void finishOnce(code ?? 0);
     });
@@ -371,7 +523,7 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
         task: taskText,
         description: options.description,
         logFile,
-        isolated,
+        isolated: actuallyIsolated,
         model: effectiveModel,
         reasoning: thinking,
       },
@@ -388,7 +540,7 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
     background: false,
     model: effectiveModel,
     reasoning: thinking,
-    isolated,
+    isolated: actuallyIsolated,
     logFile,
   });
 
@@ -406,9 +558,8 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
         status: "running",
         elapsedMs: Date.now() - startTime,
         currentLine: lastLine,
-        isolated,
+        isolated: actuallyIsolated,
         logFile,
-        model: effectiveModel,
         stats: parser.getStats(),
       },
     });
@@ -417,18 +568,42 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
   const exitCode: number = await new Promise((resolve) => {
     child.on("close", (code) => {
       activeSubagentProcesses.delete(id);
+      activeSubagentHandles.delete(id);
       clearInterval(progressTimer);
-      try {
-        fsSync.closeSync(logFd);
-      } catch {}
+
+      if (options.signal && abortHandler) {
+        options.signal.removeEventListener("abort", abortHandler);
+      }
+
+      flushLineBuffer();
+
+      if (logFd !== undefined) {
+        try {
+          fsSync.closeSync(logFd);
+        } catch {}
+        logFd = undefined;
+        handle.logFd = undefined;
+      }
       resolve(code ?? 1);
     });
     child.on("error", () => {
       activeSubagentProcesses.delete(id);
+      activeSubagentHandles.delete(id);
       clearInterval(progressTimer);
-      try {
-        fsSync.closeSync(logFd);
-      } catch {}
+
+      if (options.signal && abortHandler) {
+        options.signal.removeEventListener("abort", abortHandler);
+      }
+
+      flushLineBuffer();
+
+      if (logFd !== undefined) {
+        try {
+          fsSync.closeSync(logFd);
+        } catch {}
+        logFd = undefined;
+        handle.logFd = undefined;
+      }
       resolve(1);
     });
   });
@@ -447,15 +622,19 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
 
   let cleanupDetails;
   if (worktreeInfo) {
-    cleanupDetails = await cleanupWorktree(options.cwd, worktreeInfo, taskText);
+    try {
+      cleanupDetails = await cleanupWorktree(options.cwd, worktreeInfo, taskText);
+      handle.worktreeInfo = undefined;
+    } catch {}
   }
 
-  const status = aborted ? "aborted" : exitCode === 0 ? "completed" : "failed";
+  const isSubagentAborted = aborted || handle.isAborted;
+  const status = isSubagentAborted ? "aborted" : exitCode === 0 ? "completed" : "failed";
   const stats = parser.getStats();
 
   globalSubagentTracker.registerFinish(id, {
     status,
-    exitCode,
+    exitCode: isSubagentAborted ? 130 : exitCode,
     durationMs,
     stats,
   });
@@ -483,11 +662,10 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
       model: effectiveModel,
       reasoning: thinking,
       status,
-      exitCode,
+      exitCode: isSubagentAborted ? 130 : exitCode,
       durationMs,
       logFile,
-      isolated,
-      model: effectiveModel,
+      isolated: actuallyIsolated,
       worktree: worktreeInfo
         ? {
             path: worktreeInfo.path,

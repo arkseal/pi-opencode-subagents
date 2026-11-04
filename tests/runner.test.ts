@@ -55,6 +55,48 @@ describe("Subagent Runner Configuration", () => {
     // Clean up process
     stopSubagent(result.details.id);
   });
+
+  it("handles pre-aborted signal immediately without spawning process", async () => {
+    const { executeSubagent, activeSubagentProcesses } = require("../src/runner");
+    const controller = new AbortController();
+    controller.abort();
+
+    const result = await executeSubagent({
+      task: "Task with pre-aborted signal",
+      cwd: process.cwd(),
+      isolated: false,
+      signal: controller.signal,
+    });
+
+    expect(result.details.status).toBe("aborted");
+    expect(result.details.exitCode).toBe(130);
+    expect(activeSubagentProcesses.has(result.details.id)).toBe(false);
+  });
+
+  it("stops running subagents cleanly with stopSubagent and stopAllSubagents", async () => {
+    const { executeSubagent, stopSubagent, stopAllSubagents, activeSubagentProcesses } = require("../src/runner");
+    const result1 = await executeSubagent({
+      task: "Task 1 to stop",
+      cwd: process.cwd(),
+      isolated: false,
+    });
+    const result2 = await executeSubagent({
+      task: "Task 2 to stop",
+      cwd: process.cwd(),
+      isolated: false,
+    });
+
+    expect(activeSubagentProcesses.has(result1.details.id)).toBe(true);
+    expect(activeSubagentProcesses.has(result2.details.id)).toBe(true);
+
+    const stoppedSingle = stopSubagent(result1.details.id);
+    expect(stoppedSingle).toBe(true);
+    expect(activeSubagentProcesses.has(result1.details.id)).toBe(false);
+
+    const stoppedAll = stopAllSubagents();
+    expect(stoppedAll).toBeGreaterThanOrEqual(1);
+    expect(activeSubagentProcesses.size).toBe(0);
+  });
 });
 
 describe("buildPiArgs", () => {
