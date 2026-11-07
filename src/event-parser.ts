@@ -11,6 +11,27 @@ export interface SubagentStats {
   thinkingLevel?: string;
 }
 
+export interface LiveToolCall {
+  toolCallId: string;
+  toolName: string;
+  args: any;
+  status: "running" | "completed" | "error";
+  partialResult?: any;
+  result?: any;
+  isError?: boolean;
+  durationMs?: number;
+}
+
+export interface LiveSnapshot {
+  streamingMessage?: any;
+  activeTools: LiveToolCall[];
+  recentTools: LiveToolCall[];
+  lastAssistantText?: string;
+  stopReason?: string;
+  errorMessage?: string;
+  stats: SubagentStats;
+}
+
 export interface ParsedEventPeek {
   peek?: string;
   priority?: "low" | "normal" | "high";
@@ -29,6 +50,9 @@ export interface PendingToolCall {
 
 export class SubagentEventParser {
   private pendingCalls = new Map<string, PendingToolCall>();
+  private liveToolCalls = new Map<string, LiveToolCall>();
+  private liveMessages: any[] = [];
+  private streamingMessage?: any;
   private lastStopReason?: string;
   private lastErrorMessage?: string;
   private lastAssistantText?: string;
@@ -46,6 +70,9 @@ export class SubagentEventParser {
 
   reset(): void {
     this.pendingCalls.clear();
+    this.liveToolCalls.clear();
+    this.liveMessages = [];
+    this.streamingMessage = undefined;
     this.currentTurnUsage = undefined;
     this.lastStopReason = undefined;
     this.lastErrorMessage = undefined;
@@ -72,6 +99,38 @@ export class SubagentEventParser {
 
   getLastAssistantText(): string | undefined {
     return this.lastAssistantText;
+  }
+
+  getLiveSnapshot(): LiveSnapshot {
+    const activeTools: LiveToolCall[] = [];
+    const recentTools: LiveToolCall[] = [];
+
+    for (const call of this.liveToolCalls.values()) {
+      if (call.status === "running") {
+        activeTools.push({ ...call });
+      } else {
+        recentTools.push({ ...call });
+      }
+    }
+
+    let lastAssistantText = this.lastAssistantText;
+    if (this.streamingMessage && Array.isArray(this.streamingMessage.content)) {
+      const textParts = this.streamingMessage.content
+        .filter((c: any) => c.type === "text" && typeof c.text === "string")
+        .map((c: any) => c.text);
+      const joined = textParts.join("\n").trim();
+      if (joined) lastAssistantText = joined;
+    }
+
+    return {
+      streamingMessage: this.streamingMessage ? JSON.parse(JSON.stringify(this.streamingMessage)) : undefined,
+      activeTools,
+      recentTools: recentTools.slice(-15),
+      lastAssistantText,
+      stopReason: this.lastStopReason,
+      errorMessage: this.lastErrorMessage,
+      stats: this.getStats(),
+    };
   }
 
   parseLine(line: string): ParsedEventPeek | undefined {
@@ -113,9 +172,24 @@ export class SubagentEventParser {
 
         if (id) {
           this.pendingCalls.set(id, { toolName: name, args });
+          this.liveToolCalls.set(id, {
+            toolCallId: id,
+            toolName: name,
+            args,
+            status: "running",
+          });
         }
 
         return this.formatToolStart(name, args);
+      }
+
+      // 1b. Tool execution update (partial result streaming)
+      if (ev.type === "tool_execution_update") {
+        const id = ev.toolCallId || "";
+        if (id && this.liveToolCalls.has(id)) {
+          const live = this.liveToolCalls.get(id)!;
+          live.partialResult = ev.partialResult;
+        }
       }
 
       // 2. Tool execution ended
@@ -132,6 +206,28 @@ export class SubagentEventParser {
         const content = ev.result?.content?.[0]?.text;
         const details = ev.result?.details || {};
 
+        if (id) {
+          const live = this.liveToolCalls.get(id);
+          if (live) {
+            live.status = isError ? "error" : "completed";
+            live.result = ev.result;
+            live.isError = isError;
+            if (typeof ev.durationMs === "number") {
+              live.durationMs = ev.durationMs;
+            }
+          } else {
+            this.liveToolCalls.set(id, {
+              toolCallId: id,
+              toolName: name,
+              args,
+              status: isError ? "error" : "completed",
+              result: ev.result,
+              isError,
+              durationMs: ev.durationMs,
+            });
+          }
+        }
+
         return this.formatToolEnd(name, args, content, details, isError);
       }
 
@@ -141,6 +237,82 @@ export class SubagentEventParser {
           this.currentTurnUsage = ev.usage;
         }
         const sub = ev.assistantMessageEvent;
+        if (sub) {
+          if (!this.streamingMessage) {
+            this.streamingMessage = {
+              role: "assistant",
+              content: [],
+              model: this.stats.model,
+              thinkingLevel: this.stats.thinkingLevel,
+            };
+          }
+
+          if (sub.type === "thinking_start") {
+            const index = sub.contentIndex ?? this.streamingMessage.content.length;
+            while (this.streamingMessage.content.length <= index) {
+              this.streamingMessage.content.push({ type: "thinking", thinking: "" });
+            }
+          } else if (sub.type === "thinking_delta" && typeof sub.delta === "string") {
+            if (typeof sub.contentIndex === "number") {
+              while (this.streamingMessage.content.length <= sub.contentIndex) {
+                this.streamingMessage.content.push({ type: "thinking", thinking: "" });
+              }
+              const block = this.streamingMessage.content[sub.contentIndex];
+              if (block && block.type === "thinking") {
+                block.thinking = (block.thinking || "") + sub.delta;
+              }
+            } else {
+              let block = this.streamingMessage.content[this.streamingMessage.content.length - 1];
+              if (!block || block.type !== "thinking") {
+                block = { type: "thinking", thinking: "" };
+                this.streamingMessage.content.push(block);
+              }
+              block.thinking += sub.delta;
+            }
+          }
+
+          if (sub.type === "text_start") {
+            const index = sub.contentIndex ?? this.streamingMessage.content.length;
+            while (this.streamingMessage.content.length <= index) {
+              this.streamingMessage.content.push({ type: "text", text: "" });
+            }
+          } else if (sub.type === "text_delta" && typeof sub.delta === "string") {
+            if (typeof sub.contentIndex === "number") {
+              while (this.streamingMessage.content.length <= sub.contentIndex) {
+                this.streamingMessage.content.push({ type: "text", text: "" });
+              }
+              const block = this.streamingMessage.content[sub.contentIndex];
+              if (block && block.type === "text") {
+                block.text = (block.text || "") + sub.delta;
+              }
+            } else {
+              let block = this.streamingMessage.content[this.streamingMessage.content.length - 1];
+              if (!block || block.type !== "text") {
+                block = { type: "text", text: "" };
+                this.streamingMessage.content.push(block);
+              }
+              block.text += sub.delta;
+            }
+          }
+
+          if (sub.type === "toolcall_start" || sub.type === "tool_call_start") {
+            this.streamingMessage.content.push({
+              type: "toolCall",
+              id: sub.id || sub.toolCallId,
+              name: sub.name || sub.toolName,
+              arguments: sub.arguments || sub.args || {},
+            });
+          } else if (sub.type === "toolcall_delta" || sub.type === "tool_call_delta") {
+            const id = sub.id || sub.toolCallId;
+            const block = this.streamingMessage.content.find(
+              (c: any) => c.type === "toolCall" && (c.id === id || !id)
+            );
+            if (block && sub.arguments) {
+              block.arguments = { ...block.arguments, ...sub.arguments };
+            }
+          }
+        }
+
         if (sub?.type === "thinking_delta" || sub?.type === "thinking_start") {
           return {
             peek: "thinking...",
@@ -170,13 +342,23 @@ export class SubagentEventParser {
           this.currentTurnUsage = undefined;
           this.lastStopReason = undefined;
           this.lastErrorMessage = undefined;
+          this.streamingMessage = {
+            role: "assistant",
+            content: Array.isArray(ev.message.content) ? [...ev.message.content] : [],
+            model: ev.message.model,
+            thinkingLevel: ev.message.thinkingLevel,
+          };
           if (ev.message?.model) this.stats.model = ev.message.model;
           if (ev.message?.thinkingLevel) this.stats.thinkingLevel = ev.message.thinkingLevel;
+        } else if (ev.message) {
+          this.liveMessages.push(ev.message);
         }
       }
 
       if (ev.type === "message_end") {
         if (ev.message?.role === "assistant") {
+          this.liveMessages.push(ev.message);
+          this.streamingMessage = undefined;
           if (ev.message?.model) this.stats.model = ev.message.model;
           if (ev.message?.thinkingLevel) this.stats.thinkingLevel = ev.message.thinkingLevel;
           if (ev.message?.stopReason === "error" || ev.message?.stopReason === "aborted") {
@@ -222,6 +404,8 @@ export class SubagentEventParser {
               stats: this.getStats(),
             };
           }
+        } else if (ev.message) {
+          this.liveMessages.push(ev.message);
         }
       }
 
@@ -232,6 +416,10 @@ export class SubagentEventParser {
 
       // 6. Agent ended (capture final assistant response & fallback token counting)
       if (ev.type === "agent_end") {
+        if (this.streamingMessage) {
+          this.liveMessages.push(this.streamingMessage);
+          this.streamingMessage = undefined;
+        }
         if (ev.willRetry === true) {
           return undefined;
         }

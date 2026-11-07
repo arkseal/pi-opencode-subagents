@@ -47,6 +47,16 @@ export interface ActiveSubagentHandle {
   isAborted?: boolean;
   suppressCallbacks?: boolean;
   cleanupTempPrompt?: () => void;
+  parser: SubagentEventParser;
+  sessionFile: string;
+  useRpc: boolean;
+  pendingSteers: number;
+  steeredMessages: Array<{ text: string; mode: "steer" | "follow_up"; timestamp: number }>;
+  agent?: string;
+  model?: string;
+  reasoning?: string;
+  description?: string;
+  isolated?: boolean;
 }
 
 export const activeSubagentHandles = new Map<string, ActiveSubagentHandle>();
@@ -103,9 +113,11 @@ export function killProcessGroup(child: ChildProcess): void {
     } catch {}
   }, 2000);
 
-  child.once("close", () => {
-    clearTimeout(killTimeout);
-  });
+  if (typeof child.once === "function") {
+    child.once("close", () => {
+      clearTimeout(killTimeout);
+    });
+  }
   if (typeof killTimeout.unref === "function") {
     killTimeout.unref();
   }
@@ -545,6 +557,7 @@ export interface SpawnSubagentOptions {
   description?: string;
   agent?: string; // specialized agent (default "general", or "explore", etc.)
   sessionID?: string; // continue a previous child session
+  action?: "run" | "steer" | "follow_up" | "status" | "list" | "abort" | string;
   background?: boolean; // background async execution (defaults to true)
   model?: SubagentModelOption;
   reasoning?: string;
@@ -567,8 +580,298 @@ export interface SpawnSubagentOptions {
   }) => void;
 }
 
+export function steerSubagent(
+  id: string,
+  message: string,
+  mode: "steer" | "follow_up" = "steer"
+): { ok: boolean; status: string; message: string; details?: any } {
+  const handle = activeSubagentHandles.get(id);
+  if (!handle || !handle.child || handle.child.killed || handle.child.exitCode !== null) {
+    return {
+      ok: false,
+      status: "not_running",
+      message: `Subagent "${id}" is not currently running.`,
+      details: { id, mode, message },
+    };
+  }
+
+  const reqId = "steer-" + Date.now() + "-" + Math.random().toString(36).slice(2, 6);
+  handle.pendingSteers++;
+  handle.steeredMessages.push({ text: message, mode, timestamp: Date.now() });
+
+  try {
+    handle.child.stdin?.write(JSON.stringify({ id: reqId, type: mode, message }) + "\n");
+  } catch (err: any) {
+    handle.pendingSteers = Math.max(0, handle.pendingSteers - 1);
+    return {
+      ok: false,
+      status: "write_error",
+      message: `Failed to write to subagent stdin: ${err.message}`,
+      details: { id, mode, message, error: err.message },
+    };
+  }
+
+  if (handle.logFd !== undefined) {
+    try {
+      fsSync.writeSync(handle.logFd, `\n[user ${mode}] ${message}\n`);
+    } catch {}
+  }
+
+  globalSubagentTracker.updatePeek(id, `steered: "${message.slice(0, 40)}"`, "high", 2000);
+
+  return {
+    ok: true,
+    status: "steered",
+    message: `Guidance delivered to subagent ${id} (${mode})`,
+    details: { id, mode, message, reqId },
+  };
+}
+
+export function inspectSubagent(id?: string, tailLines = 20): { output: string; details: any } {
+  if (!id) {
+    const active = globalSubagentTracker.getActiveList();
+    const recent = globalSubagentTracker.getRecentList();
+    const all = [...active, ...recent];
+
+    if (all.length === 0) {
+      return {
+        output: "No active or recent subagents found.",
+        details: { active: [], recent: [] },
+      };
+    }
+
+    const lines: string[] = ["### Subagents Overview", ""];
+
+    if (active.length > 0) {
+      lines.push(`**Active Subagents (${active.length}):**`);
+      for (const s of active) {
+        const dur = `${((Date.now() - s.startTime) / 1000).toFixed(1)}s`;
+        const handle = activeSubagentHandles.get(s.id);
+        const snapshot = handle?.parser.getLiveSnapshot();
+        const activeTool = snapshot?.activeTools[0];
+        const activity = activeTool
+          ? `running ${activeTool.toolName}(${JSON.stringify(activeTool.args || {})})`
+          : (s.currentLine || "working...");
+        const modelStr = s.model ? ` · model: ${s.model}` : "";
+        const tokenStr = snapshot?.stats?.totalTokens ? ` · ${snapshot.stats.totalTokens} tkns` : "";
+        lines.push(`- **\`${s.id}\`** [${s.agent || "general"}] (${dur}${modelStr}${tokenStr})`);
+        lines.push(`  *Task*: "${s.description || s.task}"`);
+        lines.push(`  *Activity*: ${activity}`);
+      }
+      lines.push("");
+    }
+
+    if (recent.length > 0) {
+      lines.push(`**Recent Subagents (${recent.length}):**`);
+      for (const s of recent.slice(0, 10)) {
+        const dur = s.durationMs
+          ? `${(s.durationMs / 1000).toFixed(1)}s`
+          : `${(((s.endTime ?? Date.now()) - s.startTime) / 1000).toFixed(1)}s`;
+        const statusBadge = s.status === "completed" ? "completed" : (s.status || "finished");
+        lines.push(
+          `- **\`${s.id}\`** [${s.agent || "general"}] (${statusBadge}, ${dur}): "${(s.description || s.task).slice(0, 60)}"`
+        );
+      }
+      lines.push("");
+    }
+
+    lines.push(
+      "Tip: Call `subagent_status(sessionID=\"<id>\")` or `subagent(sessionID=\"<id>\", action=\"status\")` to inspect full details of a specific subagent."
+    );
+
+    return {
+      output: lines.join("\n"),
+      details: { active, recent },
+    };
+  }
+
+  // Inspecting a specific subagent
+  const handle = activeSubagentHandles.get(id);
+  const activeList = globalSubagentTracker.getActiveList();
+  const recentList = globalSubagentTracker.getRecentList();
+  const tracked = activeList.find((s) => s.id === id) || recentList.find((s) => s.id === id);
+
+  const isRunning = Boolean(handle && handle.child && !handle.child.killed && handle.child.exitCode === null);
+  const status = isRunning ? "running" : (tracked?.status ?? "completed");
+  const agent = handle?.agent || tracked?.agent || "general";
+  const model = handle?.model || tracked?.model || "default";
+  const reasoning = handle?.reasoning || tracked?.reasoning;
+  const elapsedMs = tracked ? ((tracked.endTime ?? Date.now()) - tracked.startTime) : 0;
+  const elapsedSec = (elapsedMs / 1000).toFixed(1) + "s";
+  const worktree = handle?.worktreeInfo?.path;
+
+  const snapshot = handle?.parser.getLiveSnapshot();
+
+  const sessionsDir = getSubagentSessionsDir();
+  const conversationMessages: any[] = [];
+  try {
+    if (fsSync.existsSync(sessionsDir)) {
+      const files = fsSync.readdirSync(sessionsDir);
+      const target = files.find((f) => f.includes(id) && f.endsWith(".jsonl"));
+      if (target) {
+        const raw = fsSync.readFileSync(path.join(sessionsDir, target), "utf-8");
+        const lines = raw.split("\n").filter(Boolean);
+        for (const line of lines) {
+          try {
+            const entry = JSON.parse(line);
+            if (entry.type === "message" && entry.message) {
+              conversationMessages.push(entry.message);
+            }
+          } catch {}
+        }
+      }
+    }
+  } catch {}
+
+  const activeTools = snapshot?.activeTools ?? [];
+  const recentTools = snapshot?.recentTools ?? [];
+
+  let currentActivity = tracked?.currentLine || "Idle";
+  if (activeTools.length > 0) {
+    const t = activeTools[0];
+    const argsStr = JSON.stringify(t.args || {});
+    currentActivity = `Tool Call: ${t.toolName} ${argsStr.length > 80 ? argsStr.slice(0, 77) + "..." : argsStr}`;
+  } else if (snapshot?.streamingMessage) {
+    currentActivity = "Generating assistant response...";
+  }
+
+  const recentMsgSummaries: string[] = [];
+  for (const m of conversationMessages.slice(-tailLines)) {
+    if (m.role === "user") {
+      let t = m.content?.[0]?.text || "";
+      t = t.replace(/^You are a subagent spawned by another session\.\s*/i, "").trim();
+      recentMsgSummaries.push(`**User**: ${t.slice(0, 160)}${t.length > 160 ? "..." : ""}`);
+    } else if (m.role === "assistant") {
+      for (const part of m.content || []) {
+        if (part.type === "thinking" && part.thinking?.trim()) {
+          recentMsgSummaries.push(`*Assistant Thought*: ${part.thinking.trim().slice(0, 120)}...`);
+        } else if (part.type === "toolCall") {
+          recentMsgSummaries.push(`*Tool Call*: \`${part.name}\` (${JSON.stringify(part.arguments || {}).slice(0, 100)})`);
+        } else if (part.type === "text" && part.text?.trim()) {
+          recentMsgSummaries.push(`**Assistant**: ${part.text.trim().slice(0, 200)}${part.text.trim().length > 200 ? "..." : ""}`);
+        }
+      }
+    }
+  }
+
+  if (snapshot?.streamingMessage) {
+    for (const part of snapshot.streamingMessage.content || []) {
+      if (part.type === "thinking" && part.thinking?.trim()) {
+        recentMsgSummaries.push(`*Live Thought*: ${part.thinking.trim().slice(0, 150)}...`);
+      } else if (part.type === "text" && part.text?.trim()) {
+        recentMsgSummaries.push(`*Live Streaming Text*: ${part.text.trim().slice(0, 250)}...`);
+      }
+    }
+  }
+
+  const lines: string[] = [
+    `### Subagent Status: \`${id}\``,
+    "",
+    `- **Status**: ${status}`,
+    `- **Agent**: ${agent}`,
+    `- **Model**: ${model}${reasoning ? ` (${reasoning})` : ""}`,
+    `- **Elapsed**: ${elapsedSec}`,
+    worktree ? `- **Worktree**: \`${worktree}\`` : undefined,
+    `- **Current Activity**: ${currentActivity}`,
+  ].filter(Boolean) as string[];
+
+  if (activeTools.length > 0) {
+    lines.push("", "**Currently Running Tools:**");
+    for (const t of activeTools) {
+      lines.push(`- \`${t.toolName}\`: \`${JSON.stringify(t.args || {})}\``);
+    }
+  }
+
+  if (recentTools.length > 0) {
+    lines.push("", "**Recent Tool Calls:**");
+    for (const t of recentTools.slice(-5)) {
+      const isErr = t.isError ? " [FAILED]" : " [OK]";
+      const dur = t.durationMs !== undefined ? ` (${t.durationMs}ms)` : "";
+      lines.push(`- \`${t.toolName}\`${isErr}${dur}: \`${JSON.stringify(t.args || {}).slice(0, 80)}\``);
+    }
+  }
+
+  if (recentMsgSummaries.length > 0) {
+    lines.push("", "**Recent Conversation:**");
+    for (const msg of recentMsgSummaries.slice(-tailLines)) {
+      lines.push(`- ${msg}`);
+    }
+  }
+
+  lines.push(
+    "",
+    `Tip: Call subagent with sessionID="${id}", action="steer", task="..." to guide it while running, or action="follow_up" to queue a follow-up.`
+  );
+
+  return {
+    output: lines.join("\n"),
+    details: {
+      sessionID: id,
+      status,
+      agent,
+      model,
+      reasoning,
+      elapsedMs,
+      currentActivity,
+      activeTools,
+      recentTools,
+      recentMessages: recentMsgSummaries,
+      snapshot,
+    },
+  };
+}
+
 export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ output: string; details: any }> {
   checkSubagentDepth(options.currentDepth ?? 0);
+
+  // If sessionID is currently running, avoid competing process: steer or inspect instead
+  if (options.sessionID && activeSubagentHandles.has(options.sessionID)) {
+    const existingHandle = activeSubagentHandles.get(options.sessionID)!;
+    if (existingHandle.child && !existingHandle.child.killed && existingHandle.child.exitCode === null) {
+      const taskText = (options.task || options.prompt || "").trim();
+      if (taskText) {
+        const steerMode = options.action === "follow_up" ? "follow_up" : "steer";
+        const steerResult = steerSubagent(options.sessionID, taskText, steerMode);
+        const snapshot = existingHandle.parser.getLiveSnapshot();
+        const activeTool = snapshot.activeTools[0];
+        const currentLine = activeTool
+          ? `running ${activeTool.toolName}...`
+          : snapshot.streamingMessage
+            ? "generating response..."
+            : "steered";
+
+        const envelope = formatSubagentEnvelope({
+          id: options.sessionID,
+          sessionID: options.sessionID,
+          status: "running",
+          durationMs: 0,
+          summary: steerResult.message,
+          model: existingHandle.model,
+          reasoning: existingHandle.reasoning,
+          logFilePath: existingHandle.logFile,
+        });
+
+        return {
+          output: envelope,
+          details: {
+            id: options.sessionID,
+            sessionID: options.sessionID,
+            status: "running",
+            steered: true,
+            steerMode,
+            message: steerResult.message,
+            agent: existingHandle.agent,
+            currentLine,
+            logFile: existingHandle.logFile,
+            snapshot,
+          },
+        };
+      } else {
+        return inspectSubagent(options.sessionID);
+      }
+    }
+  }
+
   const subagentDir = getSubagentDir();
   const sessionsDir = getSubagentSessionsDir();
 
@@ -708,11 +1011,12 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
   let spawnError: string | undefined;
   const parser = new SubagentEventParser();
 
-  // Assemble CLI arguments for the Pi subagent process
-  const args = ["--mode", "json", "-p"];
+  const useRpc = !process.env.PI_BIN_PATH || process.env.PI_SUBAGENT_USE_RPC === "1";
 
-  // Persistent session directory and concrete session file for multi-turn continuation
-  args.push("--session-dir", sessionsDir, "--session", sessionFile);
+  // Assemble CLI arguments for the Pi subagent process
+  const args = useRpc
+    ? ["--mode", "rpc", "--session-dir", sessionsDir, "--session", sessionFile]
+    : ["--mode", "json", "-p", "--session-dir", sessionsDir, "--session", sessionFile];
 
   // Model override
   if (effectiveModel) {
@@ -753,7 +1057,9 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
     ? taskText
     : ["You are a subagent spawned by another session.", taskText].join("\n");
 
-  args.push("--", effectivePrompt);
+  if (!useRpc) {
+    args.push("--", effectivePrompt);
+  }
 
   const invocation = getPiInvocation(args);
   let child: ChildProcess;
@@ -764,7 +1070,7 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
         ...process.env,
         PI_SUBAGENT_DEPTH: String((options.currentDepth ?? 0) + 1),
       },
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
     });
   } catch (err) {
     cleanupTempPrompt();
@@ -790,7 +1096,25 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
     logFile,
     signal: options.signal,
     cleanupTempPrompt,
+    parser,
+    sessionFile,
+    useRpc,
+    pendingSteers: 0,
+    steeredMessages: [],
+    agent: agentProfile.id,
+    model: effectiveModel,
+    reasoning: thinking,
+    description: options.description,
+    isolated: actuallyIsolated,
   };
+
+  if (useRpc) {
+    try {
+      child.stdin?.write(
+        JSON.stringify({ id: "init-prompt", type: "prompt", message: effectivePrompt }) + "\n"
+      );
+    } catch {}
+  }
 
   activeSubagentProcesses.set(id, child);
   activeSubagentHandles.set(id, handle);
@@ -809,6 +1133,38 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
 
   const processStdoutLine = (line: string) => {
     if (!line.trim()) return;
+
+    if (useRpc && line.trim().startsWith("{")) {
+      try {
+        const ev = JSON.parse(line.trim());
+        if (ev.type === "extension_ui_request" && ev.id) {
+          try {
+            child.stdin?.write(
+              JSON.stringify({ type: "extension_ui_response", id: ev.id, cancelled: true }) + "\n"
+            );
+          } catch {}
+        }
+        if (ev.type === "response" && typeof ev.id === "string" && ev.id.startsWith("steer-")) {
+          handle.pendingSteers = Math.max(0, handle.pendingSteers - 1);
+          if (ev.success === false && ev.command === "prompt") {
+            const err = ev.error || "Failed to deliver steer prompt";
+            if (logFd !== undefined) {
+              try {
+                fsSync.writeSync(logFd, `[steer error] ${err}\n`);
+              } catch {}
+            }
+          }
+        }
+        if (ev.type === "agent_settled") {
+          if (handle.pendingSteers <= 0) {
+            try {
+              child.stdin?.end();
+            } catch {}
+          }
+        }
+      } catch {}
+    }
+
     const parsed = parser.parseLine(line);
     if (parsed) {
       if (parsed.peek) {

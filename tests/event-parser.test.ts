@@ -386,4 +386,101 @@ describe("SubagentEventParser", () => {
     expect(fallbackParser.getStopReason()).toBe("error");
     expect(fallbackParser.getErrorMessage()).toBe("provider_overloaded");
   });
+
+  it("tracks live streaming messages, tool calls, and snapshot correctly", () => {
+    const parser = new SubagentEventParser();
+
+    // 1. message_start
+    parser.parseLine(
+      JSON.stringify({
+        type: "message_start",
+        message: { role: "assistant", model: "claude-3-7-sonnet", thinkingLevel: "high" },
+      })
+    );
+
+    // 2. streaming thinking deltas
+    parser.parseLine(
+      JSON.stringify({
+        type: "message_update",
+        assistantMessageEvent: { type: "thinking_delta", delta: "Analyzing code structure... " },
+      })
+    );
+    parser.parseLine(
+      JSON.stringify({
+        type: "message_update",
+        assistantMessageEvent: { type: "thinking_delta", delta: "Plan looks good." },
+      })
+    );
+
+    // 3. tool execution start
+    parser.parseLine(
+      JSON.stringify({
+        type: "tool_execution_start",
+        toolCallId: "call_glob_1",
+        toolName: "glob",
+        args: { pattern: "*.ts" },
+      })
+    );
+
+    let snapshot = parser.getLiveSnapshot();
+    expect(snapshot.activeTools.length).toBe(1);
+    expect(snapshot.activeTools[0].toolName).toBe("glob");
+    expect(snapshot.activeTools[0].status).toBe("running");
+    expect(snapshot.streamingMessage?.content?.[0]?.thinking).toBe("Analyzing code structure... Plan looks good.");
+
+    // 4. tool execution update
+    parser.parseLine(
+      JSON.stringify({
+        type: "tool_execution_update",
+        toolCallId: "call_glob_1",
+        partialResult: { count: 3 },
+      })
+    );
+    snapshot = parser.getLiveSnapshot();
+    expect(snapshot.activeTools[0].partialResult?.count).toBe(3);
+
+    // 5. tool execution end
+    parser.parseLine(
+      JSON.stringify({
+        type: "tool_execution_end",
+        toolCallId: "call_glob_1",
+        toolName: "glob",
+        durationMs: 45,
+        result: { content: [{ type: "text", text: "a.ts\nb.ts\nc.ts" }] },
+      })
+    );
+
+    snapshot = parser.getLiveSnapshot();
+    expect(snapshot.activeTools.length).toBe(0);
+    expect(snapshot.recentTools.length).toBe(1);
+    expect(snapshot.recentTools[0].status).toBe("completed");
+    expect(snapshot.recentTools[0].durationMs).toBe(45);
+
+    // 6. streaming text response
+    parser.parseLine(
+      JSON.stringify({
+        type: "message_update",
+        assistantMessageEvent: { type: "text_delta", delta: "I found 3 files." },
+      })
+    );
+    snapshot = parser.getLiveSnapshot();
+    expect(snapshot.lastAssistantText).toBe("I found 3 files.");
+
+    // 7. message_end
+    parser.parseLine(
+      JSON.stringify({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "I found 3 files." }],
+          usage: { input: 120, output: 40 },
+        },
+      })
+    );
+
+    snapshot = parser.getLiveSnapshot();
+    expect(snapshot.streamingMessage).toBeUndefined();
+    expect(snapshot.lastAssistantText).toBe("I found 3 files.");
+    expect(snapshot.stats.totalTokens).toBe(160);
+  });
 });
