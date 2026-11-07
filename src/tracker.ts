@@ -1,3 +1,4 @@
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { type Component, stripTerminalSequences, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -149,7 +150,8 @@ export class SubagentTracker {
   private ticker: ReturnType<typeof setInterval> | null = null;
   private clearTimer: ReturnType<typeof setTimeout> | null = null;
   private frameIndex = 0;
-  private uiContext: any = null;
+  private uiContext: ExtensionContext | null = null;
+  private requestTuiRender: (() => void) | undefined;
   private isWidgetMounted = false;
   private sidebarRegistered = false;
   private theme: any = null;
@@ -246,8 +248,8 @@ export class SubagentTracker {
 
     try {
       const { SubagentViewer } = await import("./subagent-viewer.js");
-      await this.uiContext.ui.custom(
-        (tui: any, theme: any, _kb: any, done: () => void) => {
+      await this.uiContext.ui.custom<void>(
+        (tui, theme, _kb, done) => {
           return new SubagentViewer({
             initialMode: target ? "transcript" : "list",
             id: target?.id,
@@ -276,7 +278,7 @@ export class SubagentTracker {
     }
   }
 
-  setUIContext(ctx: any) {
+  setUIContext(ctx: ExtensionContext) {
     this.uiContext = ctx;
     this.ensureSidebarPanel();
     const hasRunning = Array.from(this.active.values()).some((s) => s.status === "running");
@@ -540,7 +542,10 @@ export class SubagentTracker {
     try {
       this.uiContext.ui.setWidget(
         "subagents-pinned",
-        (_tui: any, theme: any) => new PinnedSubagentsWidget(this, theme),
+        (tui, theme) => {
+          this.requestTuiRender = () => tui.requestRender();
+          return new PinnedSubagentsWidget(this, theme);
+        },
         { placement: "belowEditor" }
       );
       this.isWidgetMounted = true;
@@ -552,7 +557,7 @@ export class SubagentTracker {
     try {
       this.uiContext.ui.setWidget("subagents-pinned", undefined);
       this.uiContext.ui.setStatus("subagents", undefined);
-      this.uiContext.ui.requestRender();
+      this.requestTuiRender?.();
     } catch {}
     this.isWidgetMounted = false;
   }
@@ -572,9 +577,9 @@ export class SubagentTracker {
         this.uiContext.ui.setStatus("subagents", undefined);
       }
 
-      // 2. Request UI render
+      // 2. Request UI render through the TUI instance captured by the widget factory
       try {
-        this.uiContext.ui.requestRender();
+        this.requestTuiRender?.();
       } catch {}
     }
 

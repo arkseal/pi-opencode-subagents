@@ -1,4 +1,4 @@
-import { Box, Text, stripTerminalSequences, truncateToWidth } from "@earendil-works/pi-tui";
+import { type Component, Box, Text, stripTerminalSequences, truncateToWidth } from "@earendil-works/pi-tui";
 import * as fs from "node:fs";
 import { formatTranscriptLines } from "./transcript-formatter.js";
 

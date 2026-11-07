@@ -821,11 +821,11 @@ export class SubagentViewer implements Component {
     } else if (matchesKey(data, "down") || data === "j") {
       this.scrollOffset++;
       this.tui.requestRender();
-    } else if (matchesKey(data, "pageup")) {
+    } else if (matchesKey(data, "pageUp")) {
       this.autoTail = false;
       this.scrollOffset = Math.max(0, this.scrollOffset - 10);
       this.tui.requestRender();
-    } else if (matchesKey(data, "pagedown") || data === " ") {
+    } else if (matchesKey(data, "pageDown") || data === " ") {
       this.scrollOffset += 10;
       this.tui.requestRender();
     } else if (matchesKey(data, "home") || data === "g") {
