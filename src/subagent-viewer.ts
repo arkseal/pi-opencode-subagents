@@ -5,6 +5,8 @@ import {
   visibleWidth,
   wrapTextWithAnsi,
   stripTerminalSequences,
+  compositeTuiLine,
+  sliceByColumn,
   Markdown,
   Box,
   Text,
@@ -149,6 +151,8 @@ export class SubagentViewer implements Component {
 
   private scrollOffset = 0;
   private autoTail = true;
+  private lastMaxScrollOffset = 0;
+  private jumpToEndRect?: { row: number; colStart: number; colEnd: number };
   private frameIndex = 0;
   private timer: ReturnType<typeof setInterval> | null = null;
   private isDisposed = false;
@@ -291,7 +295,8 @@ export class SubagentViewer implements Component {
 
     let entries: any[] = [];
     const jsonlPath = this.findSessionJsonl();
-    if (jsonlPath && fs.existsSync(jsonlPath)) {
+    const hasJsonlFile = Boolean(jsonlPath && fs.existsSync(jsonlPath));
+    if (hasJsonlFile && jsonlPath) {
       try {
         const fileContent = fs.readFileSync(jsonlPath, "utf-8");
         const lines = fileContent.split("\n").filter(Boolean);
@@ -330,6 +335,61 @@ export class SubagentViewer implements Component {
         }
       }
 
+      // Also include snapshot.recentTools (for tools that completed during the current turn before .jsonl has their toolResult entry)
+      for (const t of snapshot.recentTools || []) {
+        const existingCall = entries.find(
+          (e) =>
+            e.type === "message" &&
+            e.message?.role === "assistant" &&
+            Array.isArray(e.message?.content) &&
+            e.message.content.some((c: any) => c.type === "toolCall" && c.id === t.toolCallId)
+        );
+        if (!existingCall) {
+          entries.push({
+            type: "message",
+            message: {
+              role: "assistant",
+              content: [
+                {
+                  type: "toolCall",
+                  id: t.toolCallId,
+                  name: t.toolName,
+                  arguments: t.args,
+                  isRunning: false,
+                },
+              ],
+            },
+          });
+        }
+
+        const existingResult = entries.find(
+          (e) =>
+            e.type === "message" &&
+            e.message?.role === "toolResult" &&
+            e.message?.toolCallId === t.toolCallId
+        );
+        if (!existingResult) {
+          const resultText =
+            typeof t.result === "string"
+              ? t.result
+              : t.result !== undefined && t.result !== null
+                ? JSON.stringify(t.result)
+                : typeof t.partialResult === "string"
+                  ? t.partialResult
+                  : "";
+          entries.push({
+            type: "message",
+            message: {
+              role: "toolResult",
+              toolCallId: t.toolCallId,
+              content: [{ type: "text", text: resultText }],
+              durationMs: t.durationMs,
+              isError: Boolean(t.isError || t.status === "error"),
+            },
+          });
+        }
+      }
+
       if (snapshot.streamingMessage && snapshot.streamingMessage.content?.length > 0) {
         entries.push({
           type: "message",
@@ -337,9 +397,46 @@ export class SubagentViewer implements Component {
           isStreaming: true,
         });
       }
+
+      // and handle.steeredMessages if not yet in .jsonl
+      for (const sMsg of handle.steeredMessages || []) {
+        const exists = entries.some(
+          (e) =>
+            e.type === "message" &&
+            e.message?.role === "user" &&
+            (e.message.content?.[0]?.text?.includes(sMsg.text) ||
+              e.message.content?.some?.((c: any) => c.text?.includes(sMsg.text)))
+        );
+        if (!exists) {
+          const prefix = sMsg.mode === "follow_up" ? "[user follow_up] " : "[user steer] ";
+          entries.push({
+            type: "message",
+            message: {
+              role: "user",
+              content: [{ type: "text", text: `${prefix}${sMsg.text}` }],
+            },
+          });
+        }
+      }
     }
 
-    if (entries.length > 0) {
+    const sub = this.getSubagentInfo();
+    const taskText = sub?.task || this.activeTask;
+
+    // AND if .jsonl only has the 1-line "session" header (no messages yet) while rawLogContent or sub?.task has content,
+    // synthesize the initial user message from sub.task (and any live streaming content) so the transcript is never stuck empty while the first turn streams!
+    const hasAnyUserMessage = entries.some((e) => e.type === "message" && e.message?.role === "user");
+    if (!hasAnyUserMessage && (hasJsonlFile || handle) && taskText) {
+      entries.unshift({
+        type: "message",
+        message: {
+          role: "user",
+          content: [{ type: "text", text: taskText }],
+        },
+      });
+    }
+
+    if (entries.some((e) => e.type === "message")) {
       this.parsedEntries = entries;
       this.rawLogContent = null;
       return;
@@ -868,11 +965,6 @@ export class SubagentViewer implements Component {
     const hasRunning = this.getAllSubagents().some((s) => s.status === "running");
     if (!hasRunning && this.mode !== "transcript") return;
 
-    if (this.mode === "transcript") {
-      const currentSub = this.getSubagentInfo();
-      if (currentSub && currentSub.status !== "running" && !hasRunning) return;
-    }
-
     this.timer = setInterval(() => {
       this.frameIndex = (this.frameIndex + 1) % SPINNER_FRAMES.length;
 
@@ -888,6 +980,10 @@ export class SubagentViewer implements Component {
 
       this.tui.requestRender();
     }, 90);
+
+    if (typeof (this.timer as any)?.unref === "function") {
+      (this.timer as any).unref();
+    }
   }
 
   private stopTimer() {
@@ -914,11 +1010,42 @@ export class SubagentViewer implements Component {
   invalidate() {}
 
   handleMouse(event: any): { handled?: boolean } | undefined {
+    // Floating button click handling
+    if (
+      this.mode === "transcript" &&
+      this.jumpToEndRect &&
+      (event.type === "click" || event.type === "down" || event.type === "mouseup")
+    ) {
+      const eventRow = typeof event.y === "number" ? event.y : typeof event.row === "number" ? event.row : -1;
+      const eventCol = typeof event.x === "number" ? event.x : typeof event.col === "number" ? event.col : -1;
+      if (
+        eventRow !== -1 &&
+        eventCol !== -1 &&
+        Math.abs(eventRow - this.jumpToEndRect.row) <= 1 &&
+        eventCol >= this.jumpToEndRect.colStart &&
+        eventCol <= this.jumpToEndRect.colEnd
+      ) {
+        this.autoTail = true;
+        this.scrollOffset = this.lastMaxScrollOffset;
+        this.tui.requestRender();
+        return { handled: true };
+      }
+    }
+
     if (event.type === "wheel" && event.wheelDelta) {
-      this.autoTail = false;
       const delta = event.wheelDelta < 0 ? -3 : 3;
       if (this.mode === "transcript") {
-        this.scrollOffset = Math.max(0, this.scrollOffset + delta);
+        if (delta < 0) {
+          if (this.lastMaxScrollOffset > 0) {
+            this.autoTail = false;
+            this.scrollOffset = Math.max(0, this.scrollOffset + delta);
+          }
+        } else if (delta > 0) {
+          this.scrollOffset = Math.min(this.lastMaxScrollOffset, this.scrollOffset + delta);
+          if (this.scrollOffset >= this.lastMaxScrollOffset) {
+            this.autoTail = true;
+          }
+        }
       } else {
         const items = this.getAllSubagents();
         if (items.length > 0) {
@@ -936,8 +1063,10 @@ export class SubagentViewer implements Component {
     // 1. Mouse wheel scrolling (SGR 1006 and X11)
     if (data.includes("\x1b[<64;") || data.includes("\x1b[M`")) {
       if (this.mode === "transcript") {
-        this.autoTail = false;
-        this.scrollOffset = Math.max(0, this.scrollOffset - 3);
+        if (this.lastMaxScrollOffset > 0) {
+          this.autoTail = false;
+          this.scrollOffset = Math.max(0, this.scrollOffset - 3);
+        }
         this.tui.requestRender();
       } else {
         const items = this.getAllSubagents();
@@ -951,7 +1080,10 @@ export class SubagentViewer implements Component {
 
     if (data.includes("\x1b[<65;") || data.includes("\x1b[Ma")) {
       if (this.mode === "transcript") {
-        this.scrollOffset += 3;
+        this.scrollOffset = Math.min(this.lastMaxScrollOffset, this.scrollOffset + 3);
+        if (this.scrollOffset >= this.lastMaxScrollOffset) {
+          this.autoTail = true;
+        }
         this.tui.requestRender();
       } else {
         const items = this.getAllSubagents();
@@ -961,6 +1093,23 @@ export class SubagentViewer implements Component {
         }
       }
       return;
+    }
+
+    // Parse SGR mouse left-click press: \x1b[<0;col;rowM (1-based col, row)
+    const m = data.match(/^\x1b\[<0;(\d+);(\d+)M/);
+    if (m && this.mode === "transcript" && this.jumpToEndRect) {
+      const col = parseInt(m[1], 10) - 1;
+      const row = parseInt(m[2], 10) - 1;
+      if (
+        Math.abs(row - this.jumpToEndRect.row) <= 1 &&
+        col >= this.jumpToEndRect.colStart &&
+        col <= this.jumpToEndRect.colEnd
+      ) {
+        this.autoTail = true;
+        this.scrollOffset = this.lastMaxScrollOffset;
+        this.tui.requestRender();
+        return;
+      }
     }
 
     if (data.startsWith("\x1b[<") || data.startsWith("\x1b[M")) {
@@ -1129,25 +1278,38 @@ export class SubagentViewer implements Component {
     }
 
     if (matchesKey(data, "up") || data === "k") {
-      this.autoTail = false;
-      this.scrollOffset = Math.max(0, this.scrollOffset - 1);
+      if (this.lastMaxScrollOffset > 0) {
+        this.autoTail = false;
+        this.scrollOffset = Math.max(0, this.scrollOffset - 1);
+      }
       this.tui.requestRender();
     } else if (matchesKey(data, "down") || data === "j") {
-      this.scrollOffset++;
+      this.scrollOffset = Math.min(this.lastMaxScrollOffset, this.scrollOffset + 1);
+      if (this.scrollOffset >= this.lastMaxScrollOffset) {
+        this.autoTail = true;
+      }
       this.tui.requestRender();
     } else if (matchesKey(data, "pageUp")) {
-      this.autoTail = false;
-      this.scrollOffset = Math.max(0, this.scrollOffset - 10);
+      if (this.lastMaxScrollOffset > 0) {
+        this.autoTail = false;
+        this.scrollOffset = Math.max(0, this.scrollOffset - 10);
+      }
       this.tui.requestRender();
     } else if (matchesKey(data, "pageDown") || data === " ") {
-      this.scrollOffset += 10;
+      this.scrollOffset = Math.min(this.lastMaxScrollOffset, this.scrollOffset + 10);
+      if (this.scrollOffset >= this.lastMaxScrollOffset) {
+        this.autoTail = true;
+      }
       this.tui.requestRender();
     } else if (matchesKey(data, "home") || data === "g") {
-      this.autoTail = false;
-      this.scrollOffset = 0;
+      if (this.lastMaxScrollOffset > 0) {
+        this.autoTail = false;
+        this.scrollOffset = 0;
+      }
       this.tui.requestRender();
-    } else if (matchesKey(data, "end") || data === "G") {
+    } else if (matchesKey(data, "ctrl+end") || data === "\x1b[1;5F" || matchesKey(data, "end") || data === "G") {
       this.autoTail = true;
+      this.scrollOffset = this.lastMaxScrollOffset;
       this.tui.requestRender();
     }
   }
@@ -1166,6 +1328,7 @@ export class SubagentViewer implements Component {
    * Renders the native Pi selector list with live moving progress bars and spinning status icons.
    */
   private renderList(width: number): string[] {
+    this.jumpToEndRect = undefined;
     const lines: string[] = [];
     const items = this.getAllSubagents();
 
@@ -1306,11 +1469,18 @@ export class SubagentViewer implements Component {
 
     const chatLines = this.getFormattedChatLines(width);
     const totalLines = chatLines.length;
+    const maxScrollOffset = Math.max(0, totalLines - maxVisibleRows);
+    this.lastMaxScrollOffset = maxScrollOffset;
 
     if (this.autoTail) {
-      this.scrollOffset = Math.max(0, totalLines - maxVisibleRows);
+      this.scrollOffset = maxScrollOffset;
     } else {
-      this.scrollOffset = Math.min(Math.max(0, totalLines - maxVisibleRows), this.scrollOffset);
+      if (this.scrollOffset >= maxScrollOffset) {
+        this.autoTail = true;
+        this.scrollOffset = maxScrollOffset;
+      } else {
+        this.scrollOffset = Math.max(0, Math.min(maxScrollOffset, this.scrollOffset));
+      }
     }
 
     // Pinned Top Header (permanently visible at rows 0-1)
@@ -1350,6 +1520,35 @@ export class SubagentViewer implements Component {
     const padNeeded = Math.max(0, maxVisibleRows - visibleLines.length);
     for (let i = 0; i < padNeeded; i++) {
       lines.push("");
+    }
+
+    // Floating "↓ Jump to latest message · Ctrl+End" button
+    if (!this.autoTail && this.scrollOffset < maxScrollOffset && lines.length >= headerHeight + 1) {
+      const indicatorRow = headerHeight + maxVisibleRows - 1;
+      const labelText = " ↓ Jump to latest message · Ctrl+End ";
+      const labelWidth = visibleWidth(labelText);
+      const safeLabelWidth = Math.min(labelWidth, width);
+      const colStart = Math.max(0, Math.floor((width - safeLabelWidth) / 2));
+      const fgText = typeof this.theme.fg === "function" ? this.theme.fg("text", labelText) : labelText;
+      const fgAccent = typeof this.theme.fg === "function" ? this.theme.fg("accent", labelText) : labelText;
+      const styledLabel =
+        typeof this.theme.bg === "function"
+          ? this.theme.bg("selectedBg", fgText)
+          : typeof this.theme.bold === "function"
+            ? this.theme.bold(fgAccent)
+            : fgAccent;
+
+      if (typeof compositeTuiLine === "function") {
+        lines[indicatorRow] = compositeTuiLine(lines[indicatorRow] ?? "", styledLabel, colStart, safeLabelWidth, width);
+      } else {
+        const base = lines[indicatorRow] ?? "";
+        const left = typeof sliceByColumn === "function" ? sliceByColumn(base, 0, colStart, true) : base.slice(0, colStart);
+        const right = typeof sliceByColumn === "function" ? sliceByColumn(base, colStart + safeLabelWidth, Math.max(0, width - (colStart + safeLabelWidth)), true) : base.slice(colStart + safeLabelWidth);
+        lines[indicatorRow] = `${left}${styledLabel}${right}`;
+      }
+      this.jumpToEndRect = { row: indicatorRow, colStart, colEnd: colStart + safeLabelWidth };
+    } else {
+      this.jumpToEndRect = undefined;
     }
 
     // 2. Pi's Exact Dock (Divider -> Input Margin -> Divider -> Footer)

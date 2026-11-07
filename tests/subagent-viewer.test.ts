@@ -811,4 +811,348 @@ describe("SubagentViewer", () => {
       } catch {}
     }
   });
+
+  it("auto-follows scrolling when autoTail is true as new content arrives", () => {
+    const subId = "sub_autotail_follow_test";
+    const sessionsDir = path.join(os.homedir(), ".pi", "agent", "subagents", "sessions");
+    if (!fs.existsSync(sessionsDir)) {
+      fs.mkdirSync(sessionsDir, { recursive: true });
+    }
+    const jsonlFile = path.join(sessionsDir, `2026-10-25T00-00-00-000Z_${subId}.jsonl`);
+
+    const entries: any[] = [{ type: "session", id: subId }];
+    entries.push({
+      type: "message",
+      message: { role: "user", content: [{ type: "text", text: "Starting conversation turn" }] },
+    });
+    for (let i = 1; i <= 15; i++) {
+      entries.push({
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: `Assistant turn message ${i} with substantial output` }],
+        },
+      });
+    }
+    fs.writeFileSync(jsonlFile, entries.map((e) => JSON.stringify(e)).join("\n"));
+
+    try {
+      const tracker = new SubagentTracker();
+      tracker.registerStart({
+        id: subId,
+        task: "Auto-follow test",
+        logFile: tmpLog,
+      });
+
+      const viewer = new SubagentViewer({
+        id: subId,
+        initialMode: "transcript",
+        theme: mockTheme,
+        tui: { requestRender: () => {}, terminal: { rows: 18 } },
+        tracker,
+        done: () => {},
+      });
+
+      // Initial render: autoTail is true by default
+      const rendered1 = viewer.render(80).join("\n");
+      expect((viewer as any).autoTail).toBe(true);
+      expect((viewer as any).lastMaxScrollOffset).toBeGreaterThan(0);
+      expect((viewer as any).scrollOffset).toBe((viewer as any).lastMaxScrollOffset);
+      expect(rendered1).toContain("Assistant turn message 15");
+      expect(rendered1).not.toContain("↓ Jump to latest message · Ctrl+End");
+
+      const initialOffset = (viewer as any).scrollOffset;
+
+      // Append 5 more messages to simulate subagent streaming more turns
+      for (let i = 16; i <= 20; i++) {
+        entries.push({
+          type: "message",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: `Assistant turn message ${i} with substantial output` }],
+          },
+        });
+      }
+      fs.writeFileSync(jsonlFile, entries.map((e) => JSON.stringify(e)).join("\n"));
+
+      (viewer as any).reloadChat();
+      const rendered2 = viewer.render(80).join("\n");
+
+      // Auto-tail should have scrolled down automatically to the new max offset
+      expect((viewer as any).autoTail).toBe(true);
+      expect((viewer as any).scrollOffset).toBeGreaterThan(initialOffset);
+      expect((viewer as any).scrollOffset).toBe((viewer as any).lastMaxScrollOffset);
+      expect(rendered2).toContain("Assistant turn message 20");
+      expect(rendered2).not.toContain("↓ Jump to latest message · Ctrl+End");
+
+      viewer.dispose();
+    } finally {
+      try {
+        fs.unlinkSync(jsonlFile);
+      } catch {}
+    }
+  });
+
+  it("stops auto-following on scroll up, displays floating Jump to latest button, and preserves scroll offset when new messages arrive", () => {
+    const subId = "sub_scroll_up_freeze_test";
+    const sessionsDir = path.join(os.homedir(), ".pi", "agent", "subagents", "sessions");
+    if (!fs.existsSync(sessionsDir)) {
+      fs.mkdirSync(sessionsDir, { recursive: true });
+    }
+    const jsonlFile = path.join(sessionsDir, `2026-10-25T00-00-00-000Z_${subId}.jsonl`);
+
+    const entries: any[] = [{ type: "session", id: subId }];
+    entries.push({
+      type: "message",
+      message: { role: "user", content: [{ type: "text", text: "Turn 1" }] },
+    });
+    for (let i = 1; i <= 20; i++) {
+      entries.push({
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: `Paragraph block ${i} detailing subagent output` }],
+        },
+      });
+    }
+    fs.writeFileSync(jsonlFile, entries.map((e) => JSON.stringify(e)).join("\n"));
+
+    try {
+      const tracker = new SubagentTracker();
+      tracker.registerStart({
+        id: subId,
+        task: "Scroll freeze test",
+        logFile: tmpLog,
+      });
+
+      const viewer = new SubagentViewer({
+        id: subId,
+        initialMode: "transcript",
+        theme: mockTheme,
+        tui: { requestRender: () => {}, terminal: { rows: 18 } },
+        tracker,
+        done: () => {},
+      });
+
+      // Initial render establishes lastMaxScrollOffset at bottom
+      viewer.render(80);
+      expect((viewer as any).autoTail).toBe(true);
+      const bottomOffset = (viewer as any).lastMaxScrollOffset;
+      expect(bottomOffset).toBeGreaterThan(5);
+
+      // Scroll up with 'k' key
+      viewer.handleInput("k");
+      viewer.handleInput("k");
+      viewer.handleInput("k");
+
+      expect((viewer as any).autoTail).toBe(false);
+      expect((viewer as any).scrollOffset).toBe(bottomOffset - 3);
+
+      const renderedScrolled = viewer.render(80).join("\n");
+      // Floating indicator button must be displayed
+      expect(renderedScrolled).toContain("↓ Jump to latest message · Ctrl+End");
+      expect((viewer as any).jumpToEndRect).toBeDefined();
+
+      const savedOffset = (viewer as any).scrollOffset;
+
+      // Also verify mouse wheel up sets autoTail = false
+      viewer.handleMouse({ type: "wheel", wheelDelta: -1 });
+      expect((viewer as any).autoTail).toBe(false);
+      expect((viewer as any).scrollOffset).toBe(savedOffset - 3);
+
+      const offsetAfterWheel = (viewer as any).scrollOffset;
+
+      // Append 10 more messages while scrolled up
+      for (let i = 21; i <= 30; i++) {
+        entries.push({
+          type: "message",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: `Paragraph block ${i} detailing subagent output` }],
+          },
+        });
+      }
+      fs.writeFileSync(jsonlFile, entries.map((e) => JSON.stringify(e)).join("\n"));
+
+      (viewer as any).reloadChat();
+      const renderedAfterNewMessages = viewer.render(80).join("\n");
+
+      // autoTail must remain false and viewport must NOT yank down!
+      expect((viewer as any).autoTail).toBe(false);
+      expect((viewer as any).scrollOffset).toBe(offsetAfterWheel);
+      expect((viewer as any).scrollOffset).toBeLessThan((viewer as any).lastMaxScrollOffset);
+      expect(renderedAfterNewMessages).toContain("↓ Jump to latest message · Ctrl+End");
+
+      viewer.dispose();
+    } finally {
+      try {
+        fs.unlinkSync(jsonlFile);
+      } catch {}
+    }
+  });
+
+  it("jumps to latest message and resumes auto-follow on ctrl+end, mouse click, and scrolling down", () => {
+    const subId = "sub_jump_bottom_test";
+    const sessionsDir = path.join(os.homedir(), ".pi", "agent", "subagents", "sessions");
+    if (!fs.existsSync(sessionsDir)) {
+      fs.mkdirSync(sessionsDir, { recursive: true });
+    }
+    const jsonlFile = path.join(sessionsDir, `2026-10-25T00-00-00-000Z_${subId}.jsonl`);
+
+    const entries: any[] = [{ type: "session", id: subId }];
+    entries.push({
+      type: "message",
+      message: { role: "user", content: [{ type: "text", text: "Start" }] },
+    });
+    for (let i = 1; i <= 25; i++) {
+      entries.push({
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: `Entry line item ${i}` }],
+        },
+      });
+    }
+    fs.writeFileSync(jsonlFile, entries.map((e) => JSON.stringify(e)).join("\n"));
+
+    try {
+      const tracker = new SubagentTracker();
+      tracker.registerStart({
+        id: subId,
+        task: "Jump to bottom test",
+        logFile: tmpLog,
+      });
+
+      const viewer = new SubagentViewer({
+        id: subId,
+        initialMode: "transcript",
+        theme: mockTheme,
+        tui: { requestRender: () => {}, terminal: { rows: 18 } },
+        tracker,
+        done: () => {},
+      });
+
+      // 1. Scroll up using pageUp
+      viewer.render(80);
+      viewer.handleInput("\x1b[5~"); // pageUp
+      const scrolledRender = viewer.render(80).join("\n");
+      expect((viewer as any).autoTail).toBe(false);
+      expect(scrolledRender).toContain("↓ Jump to latest message · Ctrl+End");
+
+      // Test 1: Jump to bottom via ctrl+end key
+      viewer.handleInput("\x1b[1;5F"); // ctrl+end sequence
+      expect((viewer as any).autoTail).toBe(true);
+      expect((viewer as any).scrollOffset).toBe((viewer as any).lastMaxScrollOffset);
+
+      const renderAfterCtrlEnd = viewer.render(80).join("\n");
+      expect(renderAfterCtrlEnd).not.toContain("↓ Jump to latest message · Ctrl+End");
+      expect((viewer as any).jumpToEndRect).toBeUndefined();
+
+      // Verify auto-following resumes after ctrl+end
+      entries.push({
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "Post-ctrl-end entry line item 26" }],
+        },
+      });
+      fs.writeFileSync(jsonlFile, entries.map((e) => JSON.stringify(e)).join("\n"));
+      (viewer as any).reloadChat();
+      const renderResumed1 = viewer.render(80).join("\n");
+      expect((viewer as any).autoTail).toBe(true);
+      expect(renderResumed1).toContain("Post-ctrl-end entry line item 26");
+
+      // Test 2: Jump to bottom via mouse click on floating button
+      viewer.handleInput("k");
+      viewer.handleInput("k");
+      viewer.handleInput("k");
+      viewer.render(80);
+      expect((viewer as any).autoTail).toBe(false);
+      const rect = (viewer as any).jumpToEndRect;
+      expect(rect).toBeDefined();
+
+      // Click on the button
+      const handledClick = viewer.handleMouse({
+        type: "click",
+        x: rect.colStart + 3,
+        y: rect.row,
+      });
+      expect(handledClick?.handled).toBe(true);
+      expect((viewer as any).autoTail).toBe(true);
+      expect((viewer as any).scrollOffset).toBe((viewer as any).lastMaxScrollOffset);
+      expect(viewer.render(80).join("\n")).not.toContain("↓ Jump to latest message · Ctrl+End");
+
+      // Test 3: Jump to bottom via SGR mouse left-click input
+      viewer.handleInput("k");
+      viewer.handleInput("k");
+      viewer.render(80);
+      expect((viewer as any).autoTail).toBe(false);
+      const rectSgr = (viewer as any).jumpToEndRect;
+      expect(rectSgr).toBeDefined();
+
+      // Send SGR mouse press (\x1b[<0;col;rowM with 1-based coordinates)
+      viewer.handleInput(`\x1b[<0;${rectSgr.colStart + 5};${rectSgr.row + 1}M`);
+      expect((viewer as any).autoTail).toBe(true);
+      expect((viewer as any).scrollOffset).toBe((viewer as any).lastMaxScrollOffset);
+      expect(viewer.render(80).join("\n")).not.toContain("↓ Jump to latest message · Ctrl+End");
+
+      // Test 4: Jump to bottom by scrolling down to the bottom
+      viewer.handleInput("k");
+      viewer.render(80);
+      expect((viewer as any).autoTail).toBe(false);
+
+      // Scroll down until reaching bottom
+      viewer.handleInput("j");
+      expect((viewer as any).autoTail).toBe(true);
+      expect((viewer as any).scrollOffset).toBe((viewer as any).lastMaxScrollOffset);
+      expect(viewer.render(80).join("\n")).not.toContain("↓ Jump to latest message · Ctrl+End");
+
+      viewer.dispose();
+    } finally {
+      try {
+        fs.unlinkSync(jsonlFile);
+      } catch {}
+    }
+  });
+
+  it("synthesizes initial user message and streams live tools when JSONL has only session header", () => {
+    const subId = "sub_live_first_turn_test";
+    const sessionsDir = path.join(os.homedir(), ".pi", "agent", "subagents", "sessions");
+    if (!fs.existsSync(sessionsDir)) {
+      fs.mkdirSync(sessionsDir, { recursive: true });
+    }
+    const jsonlFile = path.join(sessionsDir, `2026-10-25T00-00-00-000Z_${subId}.jsonl`);
+
+    // Only 1-line session header on disk
+    fs.writeFileSync(jsonlFile, JSON.stringify({ type: "session", id: subId }) + "\n");
+
+    try {
+      const tracker = new SubagentTracker();
+      tracker.registerStart({
+        id: subId,
+        task: "Synthesized prompt for first turn",
+        logFile: tmpLog,
+      });
+
+      const viewer = new SubagentViewer({
+        id: subId,
+        task: "Synthesized prompt for first turn",
+        initialMode: "transcript",
+        theme: mockTheme,
+        tui: { requestRender: () => {} },
+        tracker,
+        done: () => {},
+      });
+
+      const rendered = viewer.render(80).join("\n");
+      // The transcript must not be empty: the initial user message synthesized from task must be visible
+      expect(rendered).toContain("Synthesized prompt for first turn");
+
+      viewer.dispose();
+    } finally {
+      try {
+        fs.unlinkSync(jsonlFile);
+      } catch {}
+    }
+  });
 });
