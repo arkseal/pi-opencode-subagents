@@ -554,4 +554,135 @@ process.exit(0);
     expect(toolResult.usage.totalTokens).toBe(2650);
     expect(toolResult.usage.cost.total).toBe(0.005);
   });
+
+  it("returns isError: true synchronously on preflight model failure in background mode without double-delivering", async () => {
+    let registeredTool: any = null;
+    let sendMessageCount = 0;
+    let sendUserMessageCount = 0;
+
+    const mockPi: any = {
+      on: () => {},
+      registerTool: (t: any) => {
+        registeredTool = t;
+      },
+      registerCommand: () => {},
+      registerMessageRenderer: () => {},
+      appendEntry: () => {},
+      sendMessage: () => {
+        sendMessageCount++;
+      },
+      sendUserMessage: () => {
+        sendUserMessageCount++;
+      },
+      events: { emit: () => {} },
+    };
+
+    opencodeSubagentsExtension(mockPi);
+
+    const mockCtx = {
+      cwd: tmpDir,
+      hasUI: false,
+      modelRegistry: {
+        getAll: () => [
+          { id: "gpt-4o", provider: "openai" },
+          { id: "gpt-4o", provider: "azure" },
+        ],
+        hasConfiguredAuth: () => true,
+      },
+    };
+
+    // Ambiguous model specification in background mode
+    const toolResult = await registeredTool.execute(
+      "call_preflight_bg",
+      { task: "Test ambiguous model", model: "gpt-4o", background: true, isolated: false },
+      undefined,
+      undefined,
+      mockCtx
+    );
+
+    expect(toolResult.isError).toBe(true);
+    expect(toolResult.details.status).toBe("failed");
+    expect(toolResult.details.errorMessage).toContain('Ambiguous model "gpt-4o"');
+    expect(toolResult.content[0].text).toContain('Ambiguous model "gpt-4o"');
+
+    // CRITICAL: Ensure no background callback fired and no double-delivery occurred into main chat
+    expect(sendMessageCount).toBe(0);
+    expect(sendUserMessageCount).toBe(0);
+  });
+
+  it("returns isError: true synchronously on preflight model failure in foreground mode", async () => {
+    let registeredTool: any = null;
+    const mockPi: any = {
+      on: () => {},
+      registerTool: (t: any) => {
+        registeredTool = t;
+      },
+      registerCommand: () => {},
+      registerMessageRenderer: () => {},
+      appendEntry: () => {},
+      events: { emit: () => {} },
+    };
+
+    opencodeSubagentsExtension(mockPi);
+
+    const mockCtx = {
+      cwd: tmpDir,
+      hasUI: false,
+      modelRegistry: {
+        getAll: () => [{ id: "deepseek-coder", provider: "deepseek" }],
+        hasConfiguredAuth: () => false, // Unauthenticated
+      },
+    };
+
+    const toolResult = await registeredTool.execute(
+      "call_preflight_fg",
+      { task: "Test unauthenticated model", model: "deepseek-coder", background: false, isolated: false },
+      undefined,
+      undefined,
+      mockCtx
+    );
+
+    expect(toolResult.isError).toBe(true);
+    expect(toolResult.details.status).toBe("failed");
+    expect(toolResult.details.errorMessage).toContain('No authentication configured for model "deepseek/deepseek-coder"');
+  });
+
+  it("cleans up temporary system prompt directory when subagent completes", async () => {
+    const scriptPath = path.join(tmpDir, "explore-mock.mjs");
+    fs.writeFileSync(
+      scriptPath,
+      `#!/usr/bin/env node
+const msg = JSON.stringify({
+  type: "message_end",
+  message: {
+    role: "assistant",
+    content: [{ type: "text", text: "Exploration finished." }],
+    stopReason: "stop"
+  }
+});
+process.stdout.write(msg + '\\n');
+process.exit(0);
+`,
+      { mode: 0o755 }
+    );
+
+    process.env.PI_BIN_PATH = scriptPath;
+
+    // Run explore agent which has a non-empty system prompt (injecting via 0o600 temp file)
+    const res = await executeSubagent({
+      task: "Inspect directories",
+      agent: "explore",
+      cwd: tmpDir,
+      isolated: false,
+      background: false,
+    });
+
+    expect(res.details.status).toBe("completed");
+
+    // Verify no pi-subagent-prompt-* directory was left orphaned
+    const remainingTempDirs = fs
+      .readdirSync(os.tmpdir())
+      .filter((entry) => entry.startsWith("pi-subagent-prompt-"));
+    expect(remainingTempDirs.length).toBe(0);
+  });
 });

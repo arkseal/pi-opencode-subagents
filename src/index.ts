@@ -380,116 +380,130 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
       }
       const isBackground = params.background !== false;
 
-      const result = await executeSubagent({
-        task,
-        prompt: task,
-        agent: params.agent,
-        description: params.description,
-        sessionID: params.sessionID,
-        background: isBackground,
-        cwd: ctx.cwd,
-        isolated: params.isolated ?? true,
-        model: params.model,
-        reasoning: params.reasoning ?? params.thinking,
-        thinking: params.thinking,
-        currentDepth: depth,
-        signal,
-        onUpdate,
-        uiContext: ctx,
-        onBackgroundComplete: (bgResult) => {
-          const currentLine =
-            bgResult.status === "completed"
-              ? "Done"
-              : bgResult.status === "aborted"
-                ? "Aborted"
-                : (bgResult.errorMessage || "Failed");
+      let result;
+      try {
+        result = await executeSubagent({
+          task,
+          prompt: task,
+          agent: params.agent,
+          description: params.description,
+          sessionID: params.sessionID,
+          background: isBackground,
+          cwd: ctx.cwd,
+          isolated: params.isolated ?? true,
+          model: params.model,
+          reasoning: params.reasoning ?? params.thinking,
+          thinking: params.thinking,
+          currentDepth: depth,
+          signal,
+          onUpdate,
+          uiContext: ctx,
+          onBackgroundComplete: (bgResult) => {
+            const currentLine =
+              bgResult.status === "completed"
+                ? "Done"
+                : bgResult.status === "aborted"
+                  ? "Aborted"
+                  : (bgResult.errorMessage || "Failed");
 
-          // Deliver completion record to session JSONL
-          try {
-            const record = {
-              id: bgResult.id,
-              sessionID: bgResult.sessionID,
-              agent: params.agent,
-              task,
-              description: params.description,
-              model: (bgResult as any).model ?? params.model,
-              reasoning: (bgResult as any).reasoning ?? (params.reasoning ?? params.thinking),
-              startTime: Date.now() - (bgResult.durationMs ?? 0),
-              endTime: Date.now(),
-              durationMs: bgResult.durationMs,
-              status: bgResult.status,
-              isolated: (bgResult as any).isolated ?? params.isolated ?? true,
-              logFile: (bgResult as any).logFile,
-              currentLine,
-              stats: bgResult.stats,
-            };
-            if (typeof (pi as any).appendEntry === "function") {
-              (pi as any).appendEntry("subagent_record", record);
-            } else if (ctx.sessionManager && typeof (ctx.sessionManager as any).appendCustomEntry === "function") {
-              (ctx.sessionManager as any).appendCustomEntry("subagent_record", record);
-            }
-          } catch {}
-
-          // Automatically deliver subagent response into main chat
-          const settings = loadSubagentSettings();
-          if (settings.autoDeliver !== false) {
+            // Deliver completion record to session JSONL
             try {
-              const envelope = formatSubagentEnvelope({
+              const record = {
                 id: bgResult.id,
                 sessionID: bgResult.sessionID,
-                status: bgResult.status as any,
-                durationMs: bgResult.durationMs,
-                summary: bgResult.summary,
+                agent: params.agent,
+                task,
+                description: params.description,
                 model: (bgResult as any).model ?? params.model,
                 reasoning: (bgResult as any).reasoning ?? (params.reasoning ?? params.thinking),
+                startTime: Date.now() - (bgResult.durationMs ?? 0),
+                endTime: Date.now(),
+                durationMs: bgResult.durationMs,
+                status: bgResult.status,
+                isolated: (bgResult as any).isolated ?? params.isolated ?? true,
+                logFile: (bgResult as any).logFile,
+                currentLine,
                 stats: bgResult.stats,
-                logFilePath: (bgResult as any).logFile,
-              });
+              };
+              if (typeof (pi as any).appendEntry === "function") {
+                (pi as any).appendEntry("subagent_record", record);
+              } else if (ctx.sessionManager && typeof (ctx.sessionManager as any).appendCustomEntry === "function") {
+                (ctx.sessionManager as any).appendCustomEntry("subagent_record", record);
+              }
+            } catch {}
 
-              const triggerTurn = bgResult.status !== "aborted";
+            // Automatically deliver subagent response into main chat
+            const settings = loadSubagentSettings();
+            if (settings.autoDeliver !== false) {
+              try {
+                const envelope = formatSubagentEnvelope({
+                  id: bgResult.id,
+                  sessionID: bgResult.sessionID,
+                  status: bgResult.status as any,
+                  durationMs: bgResult.durationMs,
+                  summary: bgResult.summary,
+                  model: (bgResult as any).model ?? params.model,
+                  reasoning: (bgResult as any).reasoning ?? (params.reasoning ?? params.thinking),
+                  stats: bgResult.stats,
+                  logFilePath: (bgResult as any).logFile,
+                });
 
-              // Deliver visually compacted response using sendMessage if supported, else sendUserMessage
-              if (typeof (pi as any).sendMessage === "function") {
-                (pi as any).sendMessage(
-                  {
-                    customType: "subagent-response",
-                    content: envelope,
-                    display: true,
-                    details: {
-                      id: bgResult.id,
-                      sessionID: bgResult.sessionID,
-                      status: bgResult.status,
-                      durationMs: bgResult.durationMs,
-                      summary: bgResult.summary,
-                      stats: bgResult.stats,
-                      model: (bgResult as any).model ?? params.model,
-                      reasoning: (bgResult as any).reasoning ?? (params.reasoning ?? params.thinking),
-                      logFile: (bgResult as any).logFile,
-                      task,
-                      description: params.description,
-                      agent: params.agent,
+                const triggerTurn = bgResult.status !== "aborted";
+
+                // Deliver visually compacted response using sendMessage if supported, else sendUserMessage
+                if (typeof (pi as any).sendMessage === "function") {
+                  (pi as any).sendMessage(
+                    {
+                      customType: "subagent-response",
+                      content: envelope,
+                      display: true,
+                      details: {
+                        id: bgResult.id,
+                        sessionID: bgResult.sessionID,
+                        status: bgResult.status,
+                        durationMs: bgResult.durationMs,
+                        summary: bgResult.summary,
+                        stats: bgResult.stats,
+                        model: (bgResult as any).model ?? params.model,
+                        reasoning: (bgResult as any).reasoning ?? (params.reasoning ?? params.thinking),
+                        logFile: (bgResult as any).logFile,
+                        task,
+                        description: params.description,
+                        agent: params.agent,
+                      },
                     },
-                  },
-                  {
-                    triggerTurn,
-                    deliverAs: isAgentActive ? "steer" : undefined,
-                  }
-                );
-              } else if (typeof (pi as any).sendUserMessage === "function") {
-                if (triggerTurn) {
-                  if (isAgentActive) {
-                    (pi as any).sendUserMessage(envelope, { deliverAs: "steer" });
-                  } else {
-                    (pi as any).sendUserMessage(envelope);
+                    {
+                      triggerTurn,
+                      deliverAs: isAgentActive ? "steer" : undefined,
+                    }
+                  );
+                } else if (typeof (pi as any).sendUserMessage === "function") {
+                  if (triggerTurn) {
+                    if (isAgentActive) {
+                      (pi as any).sendUserMessage(envelope, { deliverAs: "steer" });
+                    } else {
+                      (pi as any).sendUserMessage(envelope);
+                    }
                   }
                 }
+              } catch (err) {
+                console.error("Failed to deliver subagent response to main chat:", err);
               }
-            } catch (err) {
-              console.error("Failed to deliver subagent response to main chat:", err);
             }
-          }
-        },
-      });
+          },
+        });
+      } catch (err: any) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: "text", text: `Subagent failed to start: ${errorMsg}` }],
+          details: {
+            id: "subagent_failed",
+            status: "failed",
+            errorMessage: errorMsg,
+          },
+          isError: true,
+        };
+      }
 
       const cumulative = globalSubagentTracker.getCumulativeStats();
       result.details.cumulativeStats = cumulative;

@@ -71,6 +71,31 @@ describe("Subagent /fork Support Integration", () => {
     ];
     expect(findSubagentTurnEndEntryId(entries4, "cm1")).toBe("a2");
     expect(findSubagentTurnEndEntryId(entries4, "cm2")).toBe("a3");
+
+    // 5. CM1 -> R2 (subagent_record) -> A2 -> CM2 -> A3 (subagent 2 finishes while A2 is streaming)
+    const entries5 = [
+      { id: "cm1", type: "custom_message", customType: "subagent-response", parentId: "a1" },
+      { id: "r2", type: "custom", customType: "subagent_record", parentId: "cm1" },
+      { id: "a2", type: "message", message: { role: "assistant", content: [{ type: "text", text: "Turn 1 reply" }] }, parentId: "r2" },
+      { id: "cm2", type: "custom_message", customType: "subagent-response", parentId: "a2" },
+      { id: "a3", type: "message", message: { role: "assistant", content: [{ type: "text", text: "Turn 2 reply" }] }, parentId: "cm2" },
+    ];
+    expect(findSubagentTurnEndEntryId(entries5, "cm1", entries5)).toBe("a2");
+    expect(findSubagentTurnEndEntryId(entries5, "cm1")).toBe("a2");
+    expect(findSubagentTurnEndEntryId(entries5, "cm2", entries5)).toBe("a3");
+    expect(findSubagentTurnEndEntryId(entries5, "cm2")).toBe("a3");
+
+    // 6. Branched tree (/tree) with multiple alternate replies from CM1
+    const branchedEntries = [
+      { id: "cm1", type: "custom_message", customType: "subagent-response", parentId: "a1" },
+      { id: "a2_branch1", type: "message", message: { role: "assistant", content: [{ type: "text", text: "Old reply" }] }, parentId: "cm1" },
+      { id: "a2_branch2", type: "message", message: { role: "assistant", content: [{ type: "text", text: "New reply" }] }, parentId: "cm1" },
+    ];
+    const activeBranch = [
+      { id: "cm1", type: "custom_message", customType: "subagent-response", parentId: "a1" },
+      { id: "a2_branch2", type: "message", message: { role: "assistant", content: [{ type: "text", text: "New reply" }] }, parentId: "cm1" },
+    ];
+    expect(findSubagentTurnEndEntryId(branchedEntries, "cm1", activeBranch)).toBe("a2_branch2");
   });
 
   it("formatSubagentForkLabel extracts concise human-readable labels", () => {
@@ -109,8 +134,9 @@ describe("Subagent /fork Support Integration", () => {
     }).not.toThrow();
   });
 
-  it("integrates with real Pi AgentSession and AgentSessionRuntime to fork background subagent turns", async () => {
-    const services = await createAgentSessionServices({ cwd: tmpDir });
+  it("integrates with real Pi AgentSession and AgentSessionRuntime to fork background subagent turns with disk persistence", async () => {
+    const agentDir = path.join(tmpDir, ".pi");
+    const services = await createAgentSessionServices({ cwd: tmpDir, agentDir });
     const { session } = await createAgentSessionFromServices({ services });
 
     const runtime = new AgentSessionRuntime(session, services, async (opts) => {
@@ -122,6 +148,7 @@ describe("Subagent /fork Support Integration", () => {
     });
 
     const sm = session.sessionManager;
+    expect(sm.isPersisted()).toBe(true);
 
     // Simulate Turn 1: User message U1 -> Assistant message A1
     const u1Id = sm.appendMessage({ role: "user", content: [{ type: "text", text: "Launch test subagent" }] });
@@ -140,6 +167,17 @@ describe("Subagent /fork Support Integration", () => {
       content: [{ type: "text", text: "Subagent finished; found 3 controllers in src/auth." }],
     });
 
+    // Verify source session file was written to disk and holds CM1, A2, and subagent_record
+    const sourceSessionFile = session.sessionFile;
+    expect(sourceSessionFile).toBeDefined();
+    expect(fs.existsSync(sourceSessionFile!)).toBe(true);
+    const sourceDiskContent = fs.readFileSync(sourceSessionFile!, "utf-8");
+    expect(sourceDiskContent).toContain(u1Id);
+    expect(sourceDiskContent).toContain(a1Id);
+    expect(sourceDiskContent).toContain(cm1Id);
+    expect(sourceDiskContent).toContain(a2Id);
+    expect(sourceDiskContent).toContain("subagent_record");
+
     // 1. Verify getUserMessagesForForking includes U1 followed by CM1 as the latest choice
     const forkingMessages = session.getUserMessagesForForking();
     expect(forkingMessages.length).toBe(2);
@@ -150,7 +188,7 @@ describe("Subagent /fork Support Integration", () => {
     expect(forkingMessages[1].text).toContain("[Subagent sub_bg_1: Explore auth]");
     expect(forkingMessages[1].text).toContain("Subagent finished; found 3 controllers in src/auth.");
 
-    // 2. Fork from CM1 (as /fork does when selecting the latest subagent turn)
+    // 2. Fork from CM1 (as /fork does when selecting the latest subagent turn with position: "before")
     const forkResult = await runtime.fork(cm1Id);
     expect(forkResult.cancelled).toBe(false);
     expect(forkResult.selectedText).toBeUndefined(); // Editor should start clean, not dump XML envelope!
@@ -167,6 +205,19 @@ describe("Subagent /fork Support Integration", () => {
     const leaf = runtime.session.sessionManager.getLeafEntry();
     expect(leaf?.id).toBe(a2Id);
 
+    // CRITICAL: Verify forked session file was persisted to disk by SessionManager.open & createBranchedSession
+    const forkedSessionFile = runtime.session.sessionFile;
+    expect(forkedSessionFile).toBeDefined();
+    expect(forkedSessionFile).not.toBe(sourceSessionFile);
+    expect(fs.existsSync(forkedSessionFile!)).toBe(true);
+
+    const forkedDiskContent = fs.readFileSync(forkedSessionFile!, "utf-8");
+    expect(forkedDiskContent).toContain(u1Id);
+    expect(forkedDiskContent).toContain(a1Id);
+    expect(forkedDiskContent).toContain(cm1Id);
+    expect(forkedDiskContent).toContain(a2Id);
+    expect(forkedDiskContent).toContain("subagent_record");
+
     // 3. Fork from U1 (verifying standard user message forking is intact)
     const forkU1Result = await runtime.fork(u1Id);
     expect(forkU1Result.cancelled).toBe(false);
@@ -178,7 +229,8 @@ describe("Subagent /fork Support Integration", () => {
   });
 
   it("handles multi-subagent and subsequent user turns (U1 -> A1 -> CM1 -> A2 -> U2 -> A3)", async () => {
-    const services = await createAgentSessionServices({ cwd: tmpDir });
+    const agentDir = path.join(tmpDir, ".pi");
+    const services = await createAgentSessionServices({ cwd: tmpDir, agentDir });
     const { session } = await createAgentSessionFromServices({ services });
 
     const runtime = new AgentSessionRuntime(session, services, async (opts) => {

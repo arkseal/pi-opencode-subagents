@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import {
   parseModelSpec,
   resolveAndValidateModel,
@@ -238,6 +239,37 @@ describe("ensureSubagentSessionFile", () => {
 
     const { isExisting } = ensureSubagentSessionFile(tmpDir, "sub_empty", targetCwd);
     expect(isExisting).toBe(false);
+  });
+
+  it("persists appended messages to disk when opened by SessionManager.open against a pre-created 1-line header file", () => {
+    const targetCwd = path.join(tmpDir, "worktree-1");
+    fs.mkdirSync(targetCwd, { recursive: true });
+    const subagentId = "sub_persisted_verify";
+
+    // 1. ensureSubagentSessionFile creates 1-line header file with flushed initial state
+    const { sessionFile, isExisting } = ensureSubagentSessionFile(tmpDir, subagentId, targetCwd);
+    expect(isExisting).toBe(false);
+    expect(fs.existsSync(sessionFile)).toBe(true);
+
+    const initialLines = fs.readFileSync(sessionFile, "utf-8").trim().split("\n");
+    expect(initialLines.length).toBe(1);
+
+    // 2. Open via SessionManager.open as the subagent process does with --session
+    const sm = SessionManager.open(sessionFile, tmpDir);
+    expect(sm.isPersisted()).toBe(true);
+    expect(sm.getSessionFile()).toBe(sessionFile);
+
+    // 3. Subagent appends user prompt and assistant reply
+    const uId = sm.appendMessage({ role: "user", content: [{ type: "text", text: "Subagent prompt" }] });
+    const aId = sm.appendMessage({ role: "assistant", content: [{ type: "text", text: "Subagent answer" }] });
+
+    // 4. Verify disk persistence: _persist saw this.flushed === true and appended entries to disk
+    const diskLines = fs.readFileSync(sessionFile, "utf-8").trim().split("\n");
+    expect(diskLines.length).toBe(3);
+    expect(diskLines[1]).toContain(uId);
+    expect(diskLines[1]).toContain("Subagent prompt");
+    expect(diskLines[2]).toContain(aId);
+    expect(diskLines[2]).toContain("Subagent answer");
   });
 });
 

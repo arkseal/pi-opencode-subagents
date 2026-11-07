@@ -594,7 +594,40 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
   }
 
   // Preflight model validation (blocks invalid/ambiguous/unauthenticated models before worktree creation or spawning)
-  effectiveModel = resolveAndValidateModel(effectiveModel, options.uiContext);
+  try {
+    effectiveModel = resolveAndValidateModel(effectiveModel, options.uiContext);
+  } catch (err: any) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    const envelope = formatSubagentEnvelope({
+      id,
+      sessionID: id,
+      status: "failed",
+      durationMs: 0,
+      summary: errorMsg,
+      logFilePath: logFile,
+      model: effectiveModel,
+      reasoning: thinking,
+    });
+    return {
+      output: envelope,
+      details: {
+        id,
+        sessionID: id,
+        agent: agentProfile.id,
+        task: taskText,
+        description: options.description,
+        model: effectiveModel,
+        reasoning: thinking,
+        status: "failed",
+        exitCode: 1,
+        durationMs: 0,
+        logFile,
+        isolated: false,
+        summary: errorMsg,
+        errorMessage: errorMsg,
+      },
+    };
+  }
 
   // Immediate abort check before allocating worktree or log file
   if (options.signal?.aborted) {
@@ -660,7 +693,7 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
     }
     if (tmpPromptDir) {
       try {
-        fsSync.rmdirSync(tmpPromptDir);
+        fsSync.rmSync(tmpPromptDir, { recursive: true, force: true });
       } catch {}
       tmpPromptDir = null;
     }
@@ -723,14 +756,29 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
   args.push("--", effectivePrompt);
 
   const invocation = getPiInvocation(args);
-  const child = spawn(invocation.command, invocation.args, {
-    cwd: workDir,
-    env: {
-      ...process.env,
-      PI_SUBAGENT_DEPTH: String((options.currentDepth ?? 0) + 1),
-    },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+  let child: ChildProcess;
+  try {
+    child = spawn(invocation.command, invocation.args, {
+      cwd: workDir,
+      env: {
+        ...process.env,
+        PI_SUBAGENT_DEPTH: String((options.currentDepth ?? 0) + 1),
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (err) {
+    cleanupTempPrompt();
+    if (logFd !== undefined) {
+      try {
+        fsSync.closeSync(logFd);
+      } catch {}
+      logFd = undefined;
+    }
+    if (worktreeInfo) {
+      await cleanupWorktree(options.cwd, worktreeInfo, "spawn failed").catch(() => {});
+    }
+    throw err;
+  }
 
   const handle: ActiveSubagentHandle = {
     id,
