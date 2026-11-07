@@ -51,6 +51,7 @@ export interface ActiveSubagentHandle {
   sessionFile: string;
   useRpc: boolean;
   pendingSteers: number;
+  agentSettled?: boolean;
   steeredMessages: Array<{ text: string; mode: "steer" | "follow_up"; timestamp: number }>;
   agent?: string;
   model?: string;
@@ -824,6 +825,16 @@ export function inspectSubagent(id?: string, tailLines = 20): { output: string; 
 export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ output: string; details: any }> {
   checkSubagentDepth(options.currentDepth ?? 0);
 
+  // If sessionID is omitted on steer/follow_up, auto-target if exactly 1 subagent is running
+  if ((options.action === "steer" || options.action === "follow_up") && !options.sessionID) {
+    const running = Array.from(activeSubagentHandles.entries()).filter(
+      ([_, h]) => h.child && !h.child.killed && h.child.exitCode === null
+    );
+    if (running.length === 1) {
+      options.sessionID = running[0][0];
+    }
+  }
+
   // If sessionID is currently running, avoid competing process: steer or inspect instead
   if (options.sessionID && activeSubagentHandles.has(options.sessionID)) {
     const existingHandle = activeSubagentHandles.get(options.sessionID)!;
@@ -1009,6 +1020,7 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
   let lastAssistantText = "";
   let stderrText = "";
   let spawnError: string | undefined;
+  let rpcError: string | undefined;
   const parser = new SubagentEventParser();
 
   const useRpc = !process.env.PI_BIN_PATH || process.env.PI_SUBAGENT_USE_RPC === "1";
@@ -1144,18 +1156,46 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
             );
           } catch {}
         }
+        // Handle initial prompt rejection in RPC mode (Pi does not emit agent_settled if prompt fails)
+        if (ev.type === "response" && ev.command === "prompt" && ev.success === false) {
+          if (!ev.id || ev.id === "init-prompt" || !ev.id.startsWith("steer-")) {
+            const err = ev.error || "Subagent prompt command rejected";
+            rpcError = err;
+            parser.recordError(err);
+            if (logFd !== undefined) {
+              try {
+                fsSync.writeSync(logFd, `[error] ${err}\n`);
+              } catch {}
+            }
+            globalSubagentTracker.updatePeek(id, `error: ${err.slice(0, 40)}`, "high", 5000);
+            try {
+              child.stdin?.end();
+            } catch {}
+          }
+        }
+        // Handle steer / follow_up RPC responses
         if (ev.type === "response" && typeof ev.id === "string" && ev.id.startsWith("steer-")) {
           handle.pendingSteers = Math.max(0, handle.pendingSteers - 1);
-          if (ev.success === false && ev.command === "prompt") {
+          if (ev.success === false) {
             const err = ev.error || "Failed to deliver steer prompt";
             if (logFd !== undefined) {
               try {
                 fsSync.writeSync(logFd, `[steer error] ${err}\n`);
               } catch {}
             }
+            // If previous run already settled and no pending steers remain, close stdin so it doesn't hang
+            if (handle.agentSettled && handle.pendingSteers <= 0) {
+              try {
+                child.stdin?.end();
+              } catch {}
+            }
+          } else {
+            // New turn accepted by Pi RPC; will emit agent_settled when that turn finishes
+            handle.agentSettled = false;
           }
         }
         if (ev.type === "agent_settled") {
+          handle.agentSettled = true;
           if (handle.pendingSteers <= 0) {
             try {
               child.stdin?.end();
@@ -1250,6 +1290,8 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
       let reason: string;
       if (spawnError) {
         reason = `Failed to spawn subagent process: ${spawnError}`;
+      } else if (rpcError) {
+        reason = `Error: ${rpcError}`;
       } else if (errorMsg) {
         reason = `Error: ${errorMsg}`;
       } else {
@@ -1360,7 +1402,7 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
       const durationMs = Date.now() - startTime;
       const stopReason = parser.getStopReason();
       const errorMsg = parser.getErrorMessage();
-      const hasErrorStop = stopReason === "error" || Boolean(errorMsg) || Boolean(spawnError);
+      const hasErrorStop = stopReason === "error" || Boolean(errorMsg) || Boolean(spawnError) || Boolean(rpcError);
       const hasAbortedStop = stopReason === "aborted";
 
       const isSubagentAborted = aborted || handle.isAborted || hasAbortedStop;
@@ -1384,7 +1426,9 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
           exitCode: effectiveExitCode,
           durationMs,
           stats,
-          errorMessage: spawnError ? `Failed to spawn subagent process: ${spawnError}` : (errorMsg || (status === "failed" ? summary : undefined)),
+          errorMessage: spawnError
+            ? `Failed to spawn subagent process: ${spawnError}`
+            : (rpcError ? `Error: ${rpcError}` : (errorMsg || (status === "failed" ? summary : undefined))),
           summary,
         });
       } catch {}
@@ -1409,7 +1453,9 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
           model: effectiveModel,
           reasoning: thinking,
           logFile,
-          errorMessage: spawnError ? `Failed to spawn subagent process: ${spawnError}` : errorMsg,
+          errorMessage: spawnError
+            ? `Failed to spawn subagent process: ${spawnError}`
+            : (rpcError ? `Error: ${rpcError}` : errorMsg),
           worktree: worktreeInfo
             ? {
                 path: worktreeInfo.path,
@@ -1535,7 +1581,7 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
   const durationMs = Date.now() - startTime;
   const stopReason = parser.getStopReason();
   const errorMsg = parser.getErrorMessage();
-  const hasErrorStop = stopReason === "error" || Boolean(errorMsg) || Boolean(spawnError);
+  const hasErrorStop = stopReason === "error" || Boolean(errorMsg) || Boolean(spawnError) || Boolean(rpcError);
   const hasAbortedStop = stopReason === "aborted";
 
   const isSubagentAborted = aborted || handle.isAborted || hasAbortedStop;

@@ -473,3 +473,70 @@ export function renderSubagentResponseMessage(
   box.addChild(new Text(sanitizedText, 0, 0));
   return box;
 }
+
+/**
+ * Renders the header for subagent_status tool calls.
+ */
+export function renderSubagentStatusCall(args: any, theme: any, context: any) {
+  const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+  let content = theme.fg("toolTitle", theme.bold("Subagent Status "));
+  if (args?.sessionID) {
+    content += theme.fg("accent", `[${args.sessionID}]`);
+  } else {
+    content += theme.fg("dim", "(all subagents)");
+  }
+  if (args?.tailLines && args.tailLines !== 15) {
+    content += " " + theme.fg("dim", `· tail ${args.tailLines}`);
+  }
+  text.setText(content);
+  return text;
+}
+
+/**
+ * Formats the tool result for subagent_status inspection in the main Pi chat.
+ */
+export function renderSubagentStatusResult(
+  result: any,
+  options: { expanded: boolean },
+  theme: any,
+  context: any
+): Component {
+  const rawContent = result.content?.[0]?.type === "text" ? result.content[0].text : "";
+  const details = result.details || {};
+  const isSingle = Boolean(details.sessionID);
+
+  const statusIcon = theme.fg("accent", "◈");
+  const title = isSingle
+    ? `${statusIcon} ${theme.bold(theme.fg("toolTitle", `Subagent Status: ${details.sessionID}`))} ${theme.fg("dim", `(${details.status || "active"})`)}`
+    : `${statusIcon} ${theme.bold(theme.fg("toolTitle", "Subagents Overview"))} ${theme.fg("dim", `(${details.active?.length ?? 0} active, ${details.recent?.length ?? 0} recent)`)}`;
+
+  const lines: string[] = [title];
+
+  if (!options.expanded) {
+    const cleanLines = rawContent
+      .split("\n")
+      .map((l: string) => l.trim())
+      .filter((l: string) => l.length > 0 && !l.startsWith("###"));
+    const preview = cleanLines.slice(0, 4);
+    for (const l of preview) {
+      lines.push(`  ${theme.fg("muted", "│")} ${theme.fg("toolOutput", truncateToWidth(l, 80))}`);
+    }
+    const expandHint = typeof context?.keyHint === "function"
+      ? context.keyHint("app.tools.expand", "to expand")
+      : "ctrl+o to expand";
+    if (cleanLines.length > 4) {
+      lines.push(`  ${theme.fg("muted", "│")} ${theme.fg("dim", `... (${cleanLines.length - 4} more lines · ${expandHint})`)}`);
+    } else {
+      lines.push(`  ${theme.fg("dim", `(${expandHint})`)}`);
+    }
+  } else {
+    lines.push(theme.fg("dim", "─".repeat(50)));
+    for (const l of rawContent.split("\n")) {
+      lines.push(`  ${theme.fg("toolOutput", l)}`);
+    }
+  }
+
+  const textComponent = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+  textComponent.setText(preserveBg(lines.join("\n")));
+  return textComponent;
+}

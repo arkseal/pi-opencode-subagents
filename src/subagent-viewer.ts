@@ -29,6 +29,7 @@ import {
   initTheme,
 } from "@earendil-works/pi-coding-agent";
 import { formatTranscriptLines } from "./transcript-formatter.js";
+import { preserveBg } from "./subagent-ui.js";
 import { type SubagentTracker, type TrackedSubagent, checkSubagentCompletionOnDisk } from "./tracker.js";
 import {
   getSubagentDir,
@@ -494,9 +495,10 @@ export class SubagentViewer implements Component {
     const safeWidth = Math.max(20, width);
 
     const fillBg = (content: string) => {
-      const vWidth = visibleWidth(content);
+      const sanitized = preserveBg(content);
+      const vWidth = visibleWidth(sanitized);
       const padLen = Math.max(0, safeWidth - vWidth);
-      const fullLine = content + " ".repeat(padLen);
+      const fullLine = sanitized + " ".repeat(padLen);
       try {
         const styled = this.theme.bg(bgToken, fullLine);
         return styled || fullLine;
@@ -553,13 +555,24 @@ export class SubagentViewer implements Component {
       if (part.arguments?.isolated === false) callHeader += " [shared]";
       if (part.arguments?.background === false) callHeader += " · blocking";
       else callHeader += " · background";
+    } else if (part.name === "read" && part.arguments?.path) {
+      callHeader = `read ${part.arguments.path}`;
+    } else if (part.name === "edit" && part.arguments?.path) {
+      callHeader = `edit ${part.arguments.path}`;
+    } else if (part.name === "write" && part.arguments?.path) {
+      callHeader = `write ${part.arguments.path}`;
+    } else if (part.name === "grep" && part.arguments?.pattern) {
+      callHeader = `grep "${part.arguments.pattern}"${part.arguments?.path ? ` ${part.arguments.path}` : ""}`;
+    } else if ((part.name === "find" || part.name === "glob") && part.arguments?.pattern) {
+      callHeader = `${part.name} "${part.arguments.pattern}"${part.arguments?.path ? ` ${part.arguments.path}` : ""}`;
     }
 
+    const targetFile = part.arguments?.path ? ` (${part.arguments.path})` : "";
     const resultTitle = isRunning
       ? `${part.name} in progress...`
       : part.name === "subagent"
         ? `Subagent completed [${part.id || ""}]`
-        : `${part.name} completed`;
+        : `${part.name} completed${targetFile}`;
 
     return this.renderGenericToolBox(
       callHeader,
@@ -567,7 +580,8 @@ export class SubagentViewer implements Component {
       res?.text || "",
       isError,
       isRunning,
-      width
+      width,
+      res?.durationMs
     );
   }
 
@@ -624,7 +638,8 @@ export class SubagentViewer implements Component {
     resultBody: string,
     isError: boolean,
     isRunning: boolean,
-    width: number
+    width: number,
+    durationMs?: number
   ): string[] {
     const innerWidth = Math.max(10, width - 6);
     const boxContent: string[] = [];
@@ -665,6 +680,12 @@ export class SubagentViewer implements Component {
       boxContent.push(this.theme.fg("dim", "  │ executing..."));
     }
 
+    // 4. Duration footer: Took 0.2s
+    if (durationMs !== undefined && durationMs > 0) {
+      boxContent.push("");
+      boxContent.push(this.theme.fg("dim", `Took ${formatDuration(durationMs)}`));
+    }
+
     const bgToken = isError ? "toolErrorBg" : isRunning ? "toolPendingBg" : "toolSuccessBg";
     return this.renderShadedBox(boxContent, width, bgToken, true);
   }
@@ -700,7 +721,8 @@ export class SubagentViewer implements Component {
         const md = new Markdown(text, 0, 0, mdTheme);
         const bgFn = (line: string) => {
           try {
-            return this.theme.bg ? this.theme.bg("userMessageBg", line) : line;
+            const sanitized = preserveBg(line);
+            return this.theme.bg ? this.theme.bg("userMessageBg", sanitized) : sanitized;
           } catch {
             return line;
           }

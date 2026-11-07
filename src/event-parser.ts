@@ -89,6 +89,11 @@ export class SubagentEventParser {
     };
   }
 
+  recordError(errorMessage: string): void {
+    this.lastStopReason = "error";
+    this.lastErrorMessage = errorMessage;
+  }
+
   getStopReason(): string | undefined {
     return this.lastStopReason;
   }
@@ -116,14 +121,24 @@ export class SubagentEventParser {
     let lastAssistantText = this.lastAssistantText;
     if (this.streamingMessage && Array.isArray(this.streamingMessage.content)) {
       const textParts = this.streamingMessage.content
-        .filter((c: any) => c.type === "text" && typeof c.text === "string")
+        .filter((c: any) => c && c.type === "text" && typeof c.text === "string")
         .map((c: any) => c.text);
       const joined = textParts.join("\n").trim();
       if (joined) lastAssistantText = joined;
     }
 
+    let clonedStreamingMessage = undefined;
+    if (this.streamingMessage) {
+      clonedStreamingMessage = {
+        ...this.streamingMessage,
+        content: Array.isArray(this.streamingMessage.content)
+          ? this.streamingMessage.content.filter(Boolean).map((c: any) => ({ ...c }))
+          : [],
+      };
+    }
+
     return {
-      streamingMessage: this.streamingMessage ? JSON.parse(JSON.stringify(this.streamingMessage)) : undefined,
+      streamingMessage: clonedStreamingMessage,
       activeTools,
       recentTools: recentTools.slice(-15),
       lastAssistantText,
@@ -139,6 +154,18 @@ export class SubagentEventParser {
 
     try {
       const ev = JSON.parse(trimmed);
+
+      // RPC response error capture
+      if (ev.type === "response" && ev.success === false) {
+        this.lastStopReason = "error";
+        if (ev.error) {
+          this.lastErrorMessage = ev.error;
+        }
+        return {
+          peek: `error: ${(ev.error || "Command rejected").slice(0, 40)}`,
+          priority: "high",
+        };
+      }
 
       // 0. Auto retry events
       if (ev.type === "auto_retry_start") {
@@ -269,6 +296,13 @@ export class SubagentEventParser {
               }
               block.thinking += sub.delta;
             }
+          } else if (sub.type === "thinking_end") {
+            if (typeof sub.contentIndex === "number" && typeof sub.content === "string") {
+              const block = this.streamingMessage.content[sub.contentIndex];
+              if (block && block.type === "thinking") {
+                block.thinking = sub.content;
+              }
+            }
           }
 
           if (sub.type === "text_start") {
@@ -293,22 +327,83 @@ export class SubagentEventParser {
               }
               block.text += sub.delta;
             }
+          } else if (sub.type === "text_end") {
+            if (typeof sub.contentIndex === "number" && typeof sub.content === "string") {
+              const block = this.streamingMessage.content[sub.contentIndex];
+              if (block && block.type === "text") {
+                block.text = sub.content;
+              }
+            }
           }
 
           if (sub.type === "toolcall_start" || sub.type === "tool_call_start") {
-            this.streamingMessage.content.push({
+            const block = {
               type: "toolCall",
+              id: sub.id || sub.toolCallId || "",
+              name: sub.name || sub.toolName || "",
+              arguments: sub.arguments || sub.args || {},
+              partialArgs: "",
+            };
+            if (typeof sub.contentIndex === "number") {
+              while (this.streamingMessage.content.length <= sub.contentIndex) {
+                this.streamingMessage.content.push(null);
+              }
+              this.streamingMessage.content[sub.contentIndex] = block;
+            } else {
+              this.streamingMessage.content.push(block);
+            }
+          } else if (sub.type === "toolcall_delta" || sub.type === "tool_call_delta") {
+            let block: any;
+            if (typeof sub.contentIndex === "number") {
+              block = this.streamingMessage.content[sub.contentIndex];
+            }
+            if (!block) {
+              const id = sub.id || sub.toolCallId;
+              block = this.streamingMessage.content.find(
+                (c: any) => c && c.type === "toolCall" && (c.id === id || !id)
+              );
+            }
+            if (block && block.type === "toolCall") {
+              if (typeof sub.delta === "string") {
+                block.partialArgs = (block.partialArgs || "") + sub.delta;
+                try {
+                  block.arguments = JSON.parse(block.partialArgs);
+                } catch {
+                  // Arguments streaming partially
+                }
+              }
+              if (sub.arguments) {
+                block.arguments = { ...block.arguments, ...sub.arguments };
+              }
+            }
+          } else if (sub.type === "toolcall_end" || sub.type === "tool_call_end") {
+            const toolCall = sub.toolCall || {
               id: sub.id || sub.toolCallId,
               name: sub.name || sub.toolName,
-              arguments: sub.arguments || sub.args || {},
-            });
-          } else if (sub.type === "toolcall_delta" || sub.type === "tool_call_delta") {
-            const id = sub.id || sub.toolCallId;
-            const block = this.streamingMessage.content.find(
-              (c: any) => c.type === "toolCall" && (c.id === id || !id)
-            );
-            if (block && sub.arguments) {
-              block.arguments = { ...block.arguments, ...sub.arguments };
+              arguments: sub.arguments,
+            };
+            if (toolCall) {
+              const finalBlock = {
+                type: "toolCall",
+                id: toolCall.id,
+                name: toolCall.name || toolCall.toolName,
+                arguments: toolCall.arguments,
+              };
+              if (typeof sub.contentIndex === "number") {
+                while (this.streamingMessage.content.length <= sub.contentIndex) {
+                  this.streamingMessage.content.push(null);
+                }
+                this.streamingMessage.content[sub.contentIndex] = finalBlock;
+              } else {
+                const idx = this.streamingMessage.content.findIndex(
+                  (c: any) => c && c.type === "toolCall" && (c.id === toolCall.id || !c.id)
+                );
+                if (idx !== -1) {
+                  this.streamingMessage.content[idx] = finalBlock;
+                } else {
+                  this.streamingMessage.content.push(finalBlock);
+                }
+              }
             }
           }
         }

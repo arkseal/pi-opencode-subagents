@@ -301,4 +301,338 @@ describe("Subagent Live Steering & Status Inspection", () => {
     expect(stdinData).toContain('"type":"steer"');
     expect(stdinData).toContain('"message":"Please use grep instead of glob"');
   });
+
+  it("subagent tool auto-targets single running subagent when sessionID is omitted on steer", async () => {
+    let subagentTool: any;
+    const mockPi: any = {
+      on: () => {},
+      registerTool: (t: any) => {
+        if (t.name === "subagent") subagentTool = t;
+      },
+      registerCommand: () => {},
+      registerMessageRenderer: () => {},
+      appendEntry: () => {},
+    };
+    opencodeSubagentsExtension(mockPi);
+
+    const mockStdin = new PassThrough();
+    let stdinData = "";
+    mockStdin.on("data", (chunk) => {
+      stdinData += chunk.toString("utf-8");
+    });
+
+    const parser = new SubagentEventParser();
+    const handle: any = {
+      id: "solo_runner_1",
+      child: {
+        stdin: mockStdin,
+        killed: false,
+        exitCode: null,
+        kill: () => {},
+        once: () => {},
+      },
+      cwd: process.cwd(),
+      taskText: "Solo task",
+      logFile: tmpLog,
+      parser,
+      sessionFile: "/tmp/session.jsonl",
+      useRpc: true,
+      pendingSteers: 0,
+      steeredMessages: [],
+    };
+    activeSubagentHandles.set("solo_runner_1", handle);
+
+    // Call steer with no sessionID
+    const steerRes = await subagentTool.execute(
+      "tc_auto_steer",
+      {
+        action: "steer",
+        task: "Change directory to src/",
+      },
+      undefined,
+      undefined,
+      { cwd: process.cwd() }
+    );
+
+    expect(steerRes.content[0].text).toContain("Guidance delivered to subagent solo_runner_1");
+    expect(stdinData).toContain('"message":"Change directory to src/"');
+  });
+
+  it("subagent tool throws clear error when sessionID is omitted on steer and no subagents are running", async () => {
+    let subagentTool: any;
+    const mockPi: any = {
+      on: () => {},
+      registerTool: (t: any) => {
+        if (t.name === "subagent") subagentTool = t;
+      },
+      registerCommand: () => {},
+      registerMessageRenderer: () => {},
+      appendEntry: () => {},
+    };
+    opencodeSubagentsExtension(mockPi);
+
+    activeSubagentHandles.clear();
+
+    await expect(
+      subagentTool.execute(
+        "tc_no_running",
+        { action: "steer", task: "Any command" },
+        undefined,
+        undefined,
+        { cwd: process.cwd() }
+      )
+    ).rejects.toThrow("No running subagents to steer");
+  });
+
+  it("subagent tool throws clear error listing running IDs when sessionID is omitted and multiple are running", async () => {
+    let subagentTool: any;
+    const mockPi: any = {
+      on: () => {},
+      registerTool: (t: any) => {
+        if (t.name === "subagent") subagentTool = t;
+      },
+      registerCommand: () => {},
+      registerMessageRenderer: () => {},
+      appendEntry: () => {},
+    };
+    opencodeSubagentsExtension(mockPi);
+
+    activeSubagentHandles.set("agent_one", {
+      id: "agent_one",
+      child: { killed: false, exitCode: null } as any,
+    } as any);
+    activeSubagentHandles.set("agent_two", {
+      id: "agent_two",
+      child: { killed: false, exitCode: null } as any,
+    } as any);
+
+    await expect(
+      subagentTool.execute(
+        "tc_multi_running",
+        { action: "steer", task: "Any command" },
+        undefined,
+        undefined,
+        { cwd: process.cwd() }
+      )
+    ).rejects.toThrow('Multiple subagents are currently running ("agent_one", "agent_two")');
+  });
+
+  it("subagent_status has renderCall and renderResult handlers for Pi TUI", () => {
+    let subagentStatusTool: any;
+    const mockPi: any = {
+      on: () => {},
+      registerTool: (t: any) => {
+        if (t.name === "subagent_status") subagentStatusTool = t;
+      },
+      registerCommand: () => {},
+      registerMessageRenderer: () => {},
+      appendEntry: () => {},
+    };
+    opencodeSubagentsExtension(mockPi);
+
+    expect(typeof subagentStatusTool.renderCall).toBe("function");
+    expect(typeof subagentStatusTool.renderResult).toBe("function");
+
+    const mockTheme = {
+      fg: (_name: string, str: string) => str,
+      bold: (str: string) => str,
+      bg: (_name: string, str: string) => str,
+    };
+
+    // Test renderCall
+    const callComp = subagentStatusTool.renderCall({ sessionID: "sub_123" }, mockTheme, {});
+    expect(callComp.render(80).join(" ")).toContain("[sub_123]");
+
+    const allComp = subagentStatusTool.renderCall({}, mockTheme, {});
+    expect(allComp.render(80).join(" ")).toContain("(all subagents)");
+
+    // Test renderResult
+    const resComp = subagentStatusTool.renderResult(
+      {
+        content: [{ type: "text", text: "### Subagent Status: `sub_123`\n- Status: running" }],
+        details: { sessionID: "sub_123", status: "running" },
+      },
+      { expanded: false },
+      mockTheme,
+      {}
+    );
+    const rendered = resComp.render(80).join("\n");
+    expect(rendered).toContain("Subagent Status: sub_123");
+    expect(rendered).toContain("- Status: running");
+  });
+
+  it("handles RPC initial prompt rejection by ending stdin and recording error", async () => {
+    const prevBin = process.env.PI_BIN_PATH;
+    const prevRpc = process.env.PI_SUBAGENT_USE_RPC;
+    const scriptPath = path.join(os.tmpdir(), `rpc_prompt_fail_${Date.now()}.mjs`);
+
+    fs.writeFileSync(
+      scriptPath,
+      `#!/usr/bin/env node
+let stdinEnded = false;
+process.stdin.on("end", () => {
+  stdinEnded = true;
+  process.exit(1);
+});
+process.stdin.on("data", (chunk) => {
+  const str = chunk.toString("utf-8");
+  if (str.includes('"init-prompt"')) {
+    process.stdout.write(JSON.stringify({
+      id: "init-prompt",
+      type: "response",
+      command: "prompt",
+      success: false,
+      error: "Authentication failed: invalid token",
+    }) + "\\n");
+  }
+});
+setTimeout(() => {
+  if (!stdinEnded) process.exit(99);
+}, 2500);
+`,
+      { mode: 0o755 }
+    );
+
+    process.env.PI_BIN_PATH = scriptPath;
+    process.env.PI_SUBAGENT_USE_RPC = "1";
+
+    try {
+      let bgCompleteCalled = false;
+      let bgStatus = "";
+      let bgError = "";
+
+      const execPromise = executeSubagent({
+        task: "Test task that fails at RPC prompt",
+        cwd: process.cwd(),
+        isolated: false,
+        background: true,
+        onBackgroundComplete: (res) => {
+          bgCompleteCalled = true;
+          bgStatus = res.status;
+          bgError = res.errorMessage || "";
+        },
+      });
+
+      const launchResult = await execPromise;
+      expect(launchResult.details.status).toBe("running");
+
+      // Await child process termination (which only happens because stdin was ended by runner.ts!)
+      let iterations = 0;
+      while (!bgCompleteCalled && iterations < 30) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        iterations++;
+      }
+
+      expect(bgCompleteCalled).toBe(true);
+      expect(bgStatus).toBe("failed");
+      expect(bgError).toContain("Authentication failed: invalid token");
+    } finally {
+      if (prevBin !== undefined) process.env.PI_BIN_PATH = prevBin;
+      else delete process.env.PI_BIN_PATH;
+      if (prevRpc !== undefined) process.env.PI_SUBAGENT_USE_RPC = prevRpc;
+      else delete process.env.PI_SUBAGENT_USE_RPC;
+      try {
+        fs.unlinkSync(scriptPath);
+      } catch {}
+    }
+  });
+
+  it("decrements pendingSteers and ends stdin on failed steer response when agent already settled", async () => {
+    const prevBin = process.env.PI_BIN_PATH;
+    const prevRpc = process.env.PI_SUBAGENT_USE_RPC;
+    const scriptPath = path.join(os.tmpdir(), `rpc_steer_fail_${Date.now()}.mjs`);
+
+    fs.writeFileSync(
+      scriptPath,
+      `#!/usr/bin/env node
+let stdinEnded = false;
+process.stdin.on("end", () => {
+  stdinEnded = true;
+  process.exit(0);
+});
+process.stdin.on("data", (chunk) => {
+  const str = chunk.toString("utf-8");
+  for (const line of str.split("\\n")) {
+    if (!line.trim()) continue;
+    try {
+      const parsed = JSON.parse(line.trim());
+      if (parsed.id === "init-prompt") {
+        // Initial prompt accepted
+        process.stdout.write(JSON.stringify({
+          id: "init-prompt",
+          type: "response",
+          command: "prompt",
+          success: true
+        }) + "\\n");
+      } else if (parsed.type === "steer") {
+        // Turn 1 settles while steer is pending
+        process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
+        // Then steer command is rejected by RPC
+        setTimeout(() => {
+          process.stdout.write(JSON.stringify({
+            id: parsed.id,
+            type: "response",
+            command: "steer",
+            success: false,
+            error: "Agent busy or queue full"
+          }) + "\\n");
+        }, 30);
+      }
+    } catch {}
+  }
+});
+setTimeout(() => {
+  if (!stdinEnded) process.exit(99);
+}, 2500);
+`,
+      { mode: 0o755 }
+    );
+
+    process.env.PI_BIN_PATH = scriptPath;
+    process.env.PI_SUBAGENT_USE_RPC = "1";
+
+    try {
+      let bgCompleteCalled = false;
+      let bgStatus = "";
+
+      const launchResult = await executeSubagent({
+        task: "Test steer settlement edge case",
+        cwd: process.cwd(),
+        isolated: false,
+        background: true,
+        onBackgroundComplete: (res) => {
+          bgCompleteCalled = true;
+          bgStatus = res.status;
+        },
+      });
+
+      const handle = activeSubagentHandles.get(launchResult.details.id)!;
+      expect(handle).toBeDefined();
+
+      // Steer subagent while turn 1 is running
+      const steerRes = steerSubagent(launchResult.details.id, "Try a different approach", "steer");
+      expect(steerRes.ok).toBe(true);
+      expect(steerRes.status).toBe("steered");
+      expect(handle.pendingSteers).toBe(1);
+
+      // Await child process termination (stdin ended after steer rejection)
+      let iterations = 0;
+      while (!bgCompleteCalled && iterations < 30) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        iterations++;
+      }
+
+      expect(bgCompleteCalled).toBe(true);
+      expect(bgStatus).toBe("failed");
+      expect(handle.pendingSteers).toBe(0);
+    } finally {
+      if (prevBin !== undefined) process.env.PI_BIN_PATH = prevBin;
+      else delete process.env.PI_BIN_PATH;
+      if (prevRpc !== undefined) process.env.PI_SUBAGENT_USE_RPC = prevRpc;
+      else delete process.env.PI_SUBAGENT_USE_RPC;
+      try {
+        fs.unlinkSync(scriptPath);
+      } catch {}
+    }
+  });
 });

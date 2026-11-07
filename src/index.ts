@@ -23,6 +23,8 @@ import {
 import {
   renderSubagentCall,
   renderSubagentResult,
+  renderSubagentStatusCall,
+  renderSubagentStatusResult,
   cleanSubagentOutput,
   buildSubagentStatsSummary,
   renderSubagentStatsMessage,
@@ -76,6 +78,8 @@ export { checkSubagentDepth, setMaxDepth } from "./depth-guard.js";
 export {
   renderSubagentCall,
   renderSubagentResult,
+  renderSubagentStatusCall,
+  renderSubagentStatusResult,
   cleanSubagentOutput,
   buildSubagentStatsSummary,
   renderSubagentStatsMessage,
@@ -324,6 +328,8 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
       },
       { additionalProperties: false }
     ),
+    renderCall: renderSubagentStatusCall,
+    renderResult: renderSubagentStatusResult,
     async execute(_toolCallId, params) {
       const res = inspectSubagent(params.sessionID, params.tailLines ?? 15);
       return {
@@ -457,22 +463,38 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
         }
       }
 
+      let targetSessionID = params.sessionID;
+
       if (action === "steer" || action === "follow_up") {
         if (!task) {
           throw new Error(`A message or task must be specified when using action="${action}".`);
         }
-        if (!params.sessionID) {
-          throw new Error(`A sessionID must be specified when using action="${action}".`);
+        if (!targetSessionID) {
+          const running = Array.from(activeSubagentHandles.entries()).filter(
+            ([_, h]) => h.child && !h.child.killed && h.child.exitCode === null
+          );
+          if (running.length === 1) {
+            targetSessionID = running[0][0];
+          } else if (running.length === 0) {
+            throw new Error(
+              `No running subagents to ${action}. Pass sessionID to continue a previous session, or start a new subagent with action="run".`
+            );
+          } else {
+            const runningIds = running.map(([id]) => `"${id}"`).join(", ");
+            throw new Error(
+              `Multiple subagents are currently running (${runningIds}). You must specify sessionID to choose which subagent to ${action}.`
+            );
+          }
         }
 
-        if (activeSubagentHandles.has(params.sessionID)) {
-          const steerResult = steerSubagent(params.sessionID, task, action);
-          const handle = activeSubagentHandles.get(params.sessionID);
+        if (activeSubagentHandles.has(targetSessionID)) {
+          const steerResult = steerSubagent(targetSessionID, task, action);
+          const handle = activeSubagentHandles.get(targetSessionID);
           const snapshot = handle?.parser.getLiveSnapshot();
           return {
             content: [{ type: "text", text: steerResult.message }],
             details: {
-              sessionID: params.sessionID,
+              sessionID: targetSessionID,
               action,
               steerResult,
               snapshot,
@@ -497,7 +519,7 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
           action,
           agent: params.agent,
           description: params.description,
-          sessionID: params.sessionID,
+          sessionID: targetSessionID,
           background: isBackground,
           cwd: ctx.cwd,
           isolated: params.isolated ?? true,

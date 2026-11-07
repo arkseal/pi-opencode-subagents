@@ -633,4 +633,182 @@ describe("SubagentViewer", () => {
     expect(output).toContain("Press i or Tab to chat with / steer this subagent");
     expect(output).not.toContain("cancel me");
   });
+
+  it("ensures ANSI background colors inside shaded boxes are preserved without \x1b[0m reset leaks", () => {
+    const subId = "sub_preserve_bg_test";
+    const sessionsDir = path.join(os.homedir(), ".pi", "agent", "subagents", "sessions");
+    if (!fs.existsSync(sessionsDir)) {
+      fs.mkdirSync(sessionsDir, { recursive: true });
+    }
+    const jsonlFile = path.join(sessionsDir, `2026-10-25T00-00-00-000Z_${subId}.jsonl`);
+
+    const entries = [
+      { type: "session", id: subId },
+      {
+        type: "message",
+        message: {
+          role: "user",
+          content: [{ type: "text", text: "Test with \x1b[0m reset inside user prompt" }],
+        },
+      },
+      {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "toolCall", id: "tc_bg_read", name: "read", arguments: { path: "src/runner.ts" } },
+          ],
+        },
+      },
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolCallId: "tc_bg_read",
+          toolName: "read",
+          content: [{ type: "text", text: "const x = \x1b[31m1\x1b[0m + \x1b[32m2\x1b[49m;" }],
+          durationMs: 120,
+        },
+      },
+    ];
+
+    fs.writeFileSync(jsonlFile, entries.map((e) => JSON.stringify(e)).join("\n"));
+
+    try {
+      const customTheme = {
+        fg: (_name: string, str: string) => str,
+        bold: (str: string) => str,
+        bg: (name: string, str: string) => `\x1b[48;${name}m${str}\x1b[49m`,
+      };
+
+      const tracker = new SubagentTracker();
+      tracker.registerStart({
+        id: subId,
+        task: "Preserve bg test",
+        logFile: tmpLog,
+      });
+
+      const viewer = new SubagentViewer({
+        id: subId,
+        initialMode: "transcript",
+        theme: customTheme,
+        tui: { requestRender: () => {} },
+        tracker,
+        done: () => {},
+      });
+
+      const rendered = viewer.render(80).join("\n");
+      // Verify tool call header formatted cleanly
+      expect(rendered).toContain("read src/runner.ts");
+      expect(rendered).toContain("Took 120ms");
+
+      // Verify that inner \x1b[0m and \x1b[49m were neutralized inside shaded box lines
+      // Notice: \x1b[0m is replaced with \x1b[39;22;23;24m and \x1b[49m stripped so background stays intact
+      expect(rendered).toContain("\x1b[39;22;23;24m");
+      expect(rendered).toContain("src/runner.ts");
+    } finally {
+      try {
+        fs.unlinkSync(jsonlFile);
+      } catch {}
+    }
+  });
+
+  it("renders specialized tool call headers for edit, write, grep, glob with duration timings", () => {
+    const subId = "sub_specialized_tools_test";
+    const sessionsDir = path.join(os.homedir(), ".pi", "agent", "subagents", "sessions");
+    if (!fs.existsSync(sessionsDir)) {
+      fs.mkdirSync(sessionsDir, { recursive: true });
+    }
+    const jsonlFile = path.join(sessionsDir, `2026-10-25T00-00-00-000Z_${subId}.jsonl`);
+
+    const entries = [
+      { type: "session", id: subId },
+      {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "toolCall", id: "tc_edit", name: "edit", arguments: { path: "src/index.ts" } },
+            { type: "toolCall", id: "tc_write", name: "write", arguments: { path: "docs/readme.md" } },
+            { type: "toolCall", id: "tc_grep", name: "grep", arguments: { pattern: "SubagentViewer", path: "src" } },
+            { type: "toolCall", id: "tc_glob", name: "glob", arguments: { pattern: "**/*.test.ts" } },
+          ],
+        },
+      },
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolCallId: "tc_edit",
+          toolName: "edit",
+          content: [{ type: "text", text: "Successfully edited" }],
+          durationMs: 85,
+        },
+      },
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolCallId: "tc_write",
+          toolName: "write",
+          content: [{ type: "text", text: "Written 50 bytes" }],
+          durationMs: 40,
+        },
+      },
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolCallId: "tc_grep",
+          toolName: "grep",
+          content: [{ type: "text", text: "Found 2 matches" }],
+          durationMs: 250,
+        },
+      },
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolCallId: "tc_glob",
+          toolName: "glob",
+          content: [{ type: "text", text: "Found 12 files" }],
+          durationMs: 15,
+        },
+      },
+    ];
+
+    fs.writeFileSync(jsonlFile, entries.map((e) => JSON.stringify(e)).join("\n"));
+
+    try {
+      const tracker = new SubagentTracker();
+      tracker.registerStart({
+        id: subId,
+        task: "Specialized tools test",
+        logFile: tmpLog,
+      });
+
+      const viewer = new SubagentViewer({
+        id: subId,
+        initialMode: "transcript",
+        theme: mockTheme,
+        tui: { requestRender: () => {}, terminal: { rows: 60 } },
+        tracker,
+        done: () => {},
+      });
+
+      const rendered = viewer.render(80).join("\n");
+      expect(rendered).toContain("edit src/index.ts");
+      expect(rendered).toContain("Took 85ms");
+      expect(rendered).toContain("write docs/readme.md");
+      expect(rendered).toContain("Took 40ms");
+      expect(rendered).toContain('grep "SubagentViewer" src');
+      expect(rendered).toContain("Took 250ms");
+      expect(rendered).toContain('glob "**/*.test.ts"');
+      expect(rendered).toContain("Took 15ms");
+    } finally {
+      try {
+        fs.unlinkSync(jsonlFile);
+      } catch {}
+    }
+  });
 });

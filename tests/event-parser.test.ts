@@ -483,4 +483,148 @@ describe("SubagentEventParser", () => {
     expect(snapshot.lastAssistantText).toBe("I found 3 files.");
     expect(snapshot.stats.totalTokens).toBe(160);
   });
+
+  it("reconstructs full streaming message from assistantMessageEvent deltas in RPC mode without ev.message", () => {
+    const parser = new SubagentEventParser();
+
+    // 1. Thinking block streaming
+    parser.parseLine(
+      JSON.stringify({
+        type: "message_update",
+        assistantMessageEvent: { type: "thinking_start", contentIndex: 0 },
+      })
+    );
+    parser.parseLine(
+      JSON.stringify({
+        type: "message_update",
+        assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "Analyzing code " },
+      })
+    );
+    parser.parseLine(
+      JSON.stringify({
+        type: "message_update",
+        assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "structure..." },
+      })
+    );
+    parser.parseLine(
+      JSON.stringify({
+        type: "message_update",
+        assistantMessageEvent: { type: "thinking_end", contentIndex: 0, content: "Analyzing code structure..." },
+      })
+    );
+
+    let snapshot = parser.getLiveSnapshot();
+    expect(snapshot.streamingMessage).toBeDefined();
+    expect(snapshot.streamingMessage.content[0].type).toBe("thinking");
+    expect(snapshot.streamingMessage.content[0].thinking).toBe("Analyzing code structure...");
+
+    // 2. Text block streaming
+    parser.parseLine(
+      JSON.stringify({
+        type: "message_update",
+        assistantMessageEvent: { type: "text_start", contentIndex: 1 },
+      })
+    );
+    parser.parseLine(
+      JSON.stringify({
+        type: "message_update",
+        assistantMessageEvent: { type: "text_delta", contentIndex: 1, delta: "Here is " },
+      })
+    );
+    parser.parseLine(
+      JSON.stringify({
+        type: "message_update",
+        assistantMessageEvent: { type: "text_delta", contentIndex: 1, delta: "the plan." },
+      })
+    );
+    parser.parseLine(
+      JSON.stringify({
+        type: "message_update",
+        assistantMessageEvent: { type: "text_end", contentIndex: 1, content: "Here is the plan." },
+      })
+    );
+
+    snapshot = parser.getLiveSnapshot();
+    expect(snapshot.streamingMessage.content[1].type).toBe("text");
+    expect(snapshot.streamingMessage.content[1].text).toBe("Here is the plan.");
+    expect(snapshot.lastAssistantText).toBe("Here is the plan.");
+
+    // 3. Tool call streaming via JSON deltas
+    parser.parseLine(
+      JSON.stringify({
+        type: "message_update",
+        assistantMessageEvent: {
+          type: "toolcall_start",
+          contentIndex: 2,
+          id: "call_read_rpc",
+          name: "read",
+        },
+      })
+    );
+    parser.parseLine(
+      JSON.stringify({
+        type: "message_update",
+        assistantMessageEvent: {
+          type: "toolcall_delta",
+          contentIndex: 2,
+          delta: '{"path":"src/',
+        },
+      })
+    );
+    parser.parseLine(
+      JSON.stringify({
+        type: "message_update",
+        assistantMessageEvent: {
+          type: "toolcall_delta",
+          contentIndex: 2,
+          delta: 'index.ts"}',
+        },
+      })
+    );
+    snapshot = parser.getLiveSnapshot();
+    expect(snapshot.streamingMessage.content[2].type).toBe("toolCall");
+    expect(snapshot.streamingMessage.content[2].arguments).toEqual({ path: "src/index.ts" });
+
+    // 4. Authoritative toolcall_end
+    parser.parseLine(
+      JSON.stringify({
+        type: "message_update",
+        assistantMessageEvent: {
+          type: "toolcall_end",
+          contentIndex: 2,
+          toolCall: {
+            id: "call_read_rpc",
+            name: "read",
+            arguments: { path: "src/index.ts" },
+          },
+        },
+      })
+    );
+
+    snapshot = parser.getLiveSnapshot();
+    expect(snapshot.streamingMessage.content[2]).toEqual({
+      type: "toolCall",
+      id: "call_read_rpc",
+      name: "read",
+      arguments: { path: "src/index.ts" },
+    });
+  });
+
+  it("handles RPC response errors directly and sets error state", () => {
+    const parser = new SubagentEventParser();
+    const parsed = parser.parseLine(
+      JSON.stringify({
+        id: "init-prompt",
+        type: "response",
+        command: "prompt",
+        success: false,
+        error: "Model quota exceeded or rate limit reached",
+      })
+    );
+
+    expect(parsed?.priority).toBe("high");
+    expect(parsed?.peek).toContain("Model quota exceeded");
+    expect(parser.getStopReason()).toBe("error");
+    expect(parser.getErrorMessage()).toBe("Model quota exceeded or rate limit reached");
+  });
 });
