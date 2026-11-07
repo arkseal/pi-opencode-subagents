@@ -121,4 +121,38 @@ describe("Session Lifecycle & Persistence Integration", () => {
       toolDef.execute("call-err", { task: "   " }, undefined, undefined, mockCtx)
     ).rejects.toThrow("A task or prompt must be specified");
   });
+
+  it("sets terminate: true on background subagent launch so main chat ends while waiting", async () => {
+    let toolDef: any = null;
+    let shutdownHandler: any = null;
+    const mockPi: any = {
+      on: (event: string, handler: any) => {
+        if (event === "session_shutdown") shutdownHandler = handler;
+      },
+      registerTool: (tool: any) => {
+        if (tool.name === "subagent") toolDef = tool;
+      },
+      registerCommand: () => {},
+      registerMessageRenderer: () => {},
+      appendEntry: () => {},
+    };
+
+    opencodeSubagentsExtension(mockPi);
+    const mockCtx: any = { cwd: process.cwd(), hasUI: false };
+
+    const res = await toolDef.execute(
+      "call-bg-term",
+      { task: "Background task that should terminate main turn", background: true, isolated: false },
+      undefined,
+      undefined,
+      mockCtx
+    );
+
+    expect(res.terminate).toBe(true);
+    expect(res.details.status).toBe("running");
+
+    if (shutdownHandler) {
+      await shutdownHandler({ reason: "quit" }, {});
+    }
+  });
 });

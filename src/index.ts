@@ -499,6 +499,7 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
               steerResult,
               snapshot,
             },
+            terminate: true,
           };
         }
         // If not currently running, fall through to executeSubagent to seamlessly continue!
@@ -580,7 +581,10 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
                   logFilePath: (bgResult as any).logFile,
                 });
 
-                const triggerTurn = bgResult.status !== "aborted";
+                const otherRunningCount = Array.from(activeSubagentHandles.values()).filter(
+                  (h) => h.id !== bgResult.id && h.child && !h.child.killed && h.child.exitCode === null
+                ).length;
+                const triggerTurn = bgResult.status !== "aborted" && otherRunningCount === 0;
 
                 // Deliver visually compacted response using sendMessage if supported, else sendUserMessage
                 if (typeof (pi as any).sendMessage === "function") {
@@ -685,10 +689,12 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
       }
 
       const isFailed = result.details.status === "failed" || result.details.status === "aborted";
+      const isRunningOrSteered = result.details.status === "running" || result.details.status === "steered";
       const toolResult: any = {
         content: [{ type: "text", text: result.output }],
         details: result.details,
         isError: isFailed,
+        ...(isBackground && isRunningOrSteered ? { terminate: true } : {}),
       };
       if (!isBackground) {
         const usage = toPiUsage(result.details?.stats);
