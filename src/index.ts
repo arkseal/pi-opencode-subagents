@@ -2,6 +2,9 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
   executeSubagent,
+  steerSubagent,
+  inspectSubagent,
+  activeSubagentHandles,
   getSubagentDir,
   getSubagentSessionsDir,
   stopSubagent,
@@ -49,6 +52,9 @@ import {
 
 export {
   executeSubagent,
+  steerSubagent,
+  inspectSubagent,
+  activeSubagentHandles,
   getSubagentDir,
   getSubagentSessionsDir,
   stopSubagent,
@@ -294,6 +300,39 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
     "- explore: Fast agent specialized for exploring codebases (read-only searcher).",
   ].join("\n");
 
+  // Register dedicated subagent_status inspection tool
+  pi.registerTool({
+    name: "subagent_status",
+    label: "Subagent Status",
+    description: "Inspect live status, current tool calls, and recent messages of one or all subagents.",
+    promptSnippet: "Inspect live subagent status, streaming thoughts, tool activity, or list all running/recent subagents",
+    parameters: Type.Object(
+      {
+        sessionID: Type.Optional(
+          Type.String({
+            description:
+              "Optional sessionID of a specific subagent to inspect in detail. Omit to list all active and recent subagents.",
+          })
+        ),
+        tailLines: Type.Optional(
+          Type.Integer({
+            minimum: 1,
+            maximum: 100,
+            description: "Number of recent transcript/message items to include (default 15)",
+          })
+        ),
+      },
+      { additionalProperties: false }
+    ),
+    async execute(_toolCallId, params) {
+      const res = inspectSubagent(params.sessionID, params.tailLines ?? 15);
+      return {
+        content: [{ type: "text", text: res.output }],
+        details: res.details,
+      };
+    },
+  });
+
   pi.registerTool({
     name: "subagent",
     label: "Subagent",
@@ -302,6 +341,8 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
     promptGuidelines: [
       "Subagents run asynchronously in the background by default without blocking the main chat. Set background=false only if you must synchronously wait for the result before continuing.",
       "Dispatch multiple subagent calls in parallel within a single turn for independent tasks.",
+      "Use subagent_status (or subagent with action='status' | 'list') to inspect running or completed subagent progress, live thoughts, and tool executions.",
+      "Use subagent with action='steer' (or action='follow_up') and sessionID to guide or chat with a running subagent on the fly without waiting.",
       "Use agent='explore' for read-only codebase exploration, keyword search, or file inspection.",
       "Pass sessionID to continue an existing child conversation instead of starting from scratch.",
       "Optionally configure a specific model or reasoning effort for subagents depending on task complexity.",
@@ -316,6 +357,12 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
         prompt: Type.Optional(
           Type.String({
             description: "Alias for task. The task for the subagent to perform.",
+          })
+        ),
+        action: Type.Optional(
+          Type.String({
+            description:
+              "Action to perform: 'run' (default: start or continue a subagent), 'steer' (send live guidance to a running subagent immediately after its current tool call), 'follow_up' (queue a follow-up message for a running subagent), 'status' (inspect live progress/messages of a subagent), 'list' (list all active and recent subagents), or 'abort' (stop a running subagent).",
           })
         ),
         agent: Type.Optional(
@@ -372,9 +419,71 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
     renderResult: renderSubagentResult,
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       globalSubagentTracker.setUIContext(ctx);
+      const action = params.action || "run";
+      const task = (params.task || params.prompt || "").trim();
+
+      if (action === "list" || (!task && !params.sessionID && action !== "run")) {
+        const inspection = inspectSubagent(undefined);
+        return {
+          content: [{ type: "text", text: inspection.output }],
+          details: inspection.details,
+        };
+      }
+
+      if (action === "status" || (!task && params.sessionID && action !== "steer" && action !== "follow_up")) {
+        const inspection = inspectSubagent(params.sessionID);
+        return {
+          content: [{ type: "text", text: inspection.output }],
+          details: inspection.details,
+        };
+      }
+
+      if (action === "abort") {
+        if (params.sessionID) {
+          const stopped = stopSubagent(params.sessionID);
+          const msg = stopped
+            ? `Subagent ${params.sessionID} aborted.`
+            : `Subagent ${params.sessionID} is not running.`;
+          return {
+            content: [{ type: "text", text: msg }],
+            details: { sessionID: params.sessionID, stopped },
+          };
+        } else {
+          const count = await shutdownAllSubagents();
+          return {
+            content: [{ type: "text", text: `Stopped ${count} running subagent(s).` }],
+            details: { stoppedCount: count },
+          };
+        }
+      }
+
+      if (action === "steer" || action === "follow_up") {
+        if (!task) {
+          throw new Error(`A message or task must be specified when using action="${action}".`);
+        }
+        if (!params.sessionID) {
+          throw new Error(`A sessionID must be specified when using action="${action}".`);
+        }
+
+        if (activeSubagentHandles.has(params.sessionID)) {
+          const steerResult = steerSubagent(params.sessionID, task, action);
+          const handle = activeSubagentHandles.get(params.sessionID);
+          const snapshot = handle?.parser.getLiveSnapshot();
+          return {
+            content: [{ type: "text", text: steerResult.message }],
+            details: {
+              sessionID: params.sessionID,
+              action,
+              steerResult,
+              snapshot,
+            },
+          };
+        }
+        // If not currently running, fall through to executeSubagent to seamlessly continue!
+      }
+
       const rawDepth = parseInt(process.env.PI_SUBAGENT_DEPTH ?? "0", 10);
       const depth = Number.isFinite(rawDepth) ? rawDepth : 0;
-      const task = (params.task || params.prompt || "").trim();
       if (!task) {
         throw new Error("A task or prompt must be specified for the subagent.");
       }
@@ -385,6 +494,7 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
         result = await executeSubagent({
           task,
           prompt: task,
+          action,
           agent: params.agent,
           description: params.description,
           sessionID: params.sessionID,
