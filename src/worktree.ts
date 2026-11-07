@@ -17,6 +17,8 @@ export interface WorktreeCleanupResult {
   hasChanges: boolean;
   branch?: string;
   path?: string;
+  preserved?: boolean;
+  error?: string;
 }
 
 async function git(cwd: string, args: string[]): Promise<string> {
@@ -66,6 +68,8 @@ export async function cleanupWorktree(
     root = await git(repoRoot, ["rev-parse", "--show-toplevel"]);
   } catch {}
 
+  let branchCreated: string | undefined;
+
   try {
     const status = await git(info.path, ["status", "--porcelain"]);
     if (status.length > 0) {
@@ -74,31 +78,94 @@ export async function cleanupWorktree(
       const safeMsg = commitMessage.trim()
         ? commitMessage.replace(/[\r\n]+/g, " ").slice(0, 120)
         : "automated changes";
-      await git(info.path, [
+
+      const commitArgs = [
         "-c",
         "user.name=Pi Subagent",
         "-c",
         "user.email=subagent@pi.local",
         "commit",
-        "--no-verify",
         "-m",
         `subagent: ${safeMsg}`,
-      ]);
-      await git(info.path, ["branch", "-f", info.branch]);
+      ];
+
+      // Try standard commit first to respect repository hooks
+      let commitOk = false;
+      try {
+        await git(info.path, commitArgs);
+        commitOk = true;
+      } catch {
+        // Fallback with --no-verify only if standard commit failed (e.g. strict pre-commit hook in subagent)
+        try {
+          await git(info.path, [...commitArgs.slice(0, 4), "--no-verify", ...commitArgs.slice(4)]);
+          commitOk = true;
+        } catch (commitErr: any) {
+          // If commit failed, DO NOT remove the dirty worktree to prevent data loss!
+          return {
+            hasChanges: true,
+            preserved: false,
+            path: info.path,
+            error: `Failed to commit worktree changes: ${commitErr?.message || String(commitErr)}. Worktree preserved at ${info.path}`,
+          };
+        }
+      }
+
+      if (commitOk) {
+        // Create branch without -f to prevent overwriting existing branches
+        let targetBranch = info.branch;
+        try {
+          await git(info.path, ["branch", targetBranch]);
+          branchCreated = targetBranch;
+        } catch {
+          // If branch name collision, generate collision-free unique branch name
+          targetBranch = `${info.branch}-${randomUUID().slice(0, 6)}`;
+          try {
+            await git(info.path, ["branch", targetBranch]);
+            branchCreated = targetBranch;
+          } catch (branchErr: any) {
+            // If branch creation failed, DO NOT remove worktree to prevent data loss!
+            return {
+              hasChanges: true,
+              preserved: false,
+              path: info.path,
+              error: `Failed to create branch for worktree: ${branchErr?.message || String(branchErr)}. Worktree preserved at ${info.path}`,
+            };
+          }
+        }
+      }
     }
 
+    // Only clean up worktree if there were no changes, or changes were safely committed and branched
     await git(root, ["worktree", "remove", "--force", info.path]);
     await git(root, ["worktree", "prune"]);
-  } catch {
+
+    return {
+      hasChanges,
+      branch: branchCreated,
+      path: info.path,
+      preserved: true,
+    };
+  } catch (err: any) {
+    if (hasChanges && !branchCreated) {
+      // DO NOT delete dirty worktree on failed preservation!
+      return {
+        hasChanges: true,
+        preserved: false,
+        path: info.path,
+        error: `Cleanup preservation error: ${err?.message || String(err)}. Worktree preserved at ${info.path}`,
+      };
+    }
+
     try {
       await fs.rm(info.path, { recursive: true, force: true });
       await git(root, ["worktree", "prune"]);
     } catch {}
-  }
 
-  return {
-    hasChanges,
-    branch: hasChanges ? info.branch : undefined,
-    path: info.path,
-  };
+    return {
+      hasChanges,
+      branch: branchCreated,
+      path: info.path,
+      preserved: Boolean(branchCreated) || !hasChanges,
+    };
+  }
 }

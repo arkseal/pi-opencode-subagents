@@ -105,4 +105,32 @@ describe("Git Worktree Isolation", () => {
 
     await fs.rm(noAuthorRepo, { recursive: true, force: true });
   });
+
+  it("preserves dirty worktree folder on disk when commit preservation fails", async () => {
+    const info = await createWorktree(mainRepo, "test-dirty-preserve");
+    expect(info).toBeDefined();
+
+    // Modify a file in the worktree
+    await fs.writeFile(path.join(info!.path, "base.txt"), "uncommittable content\n");
+
+    // Intentionally create a mock broken git state by breaking index lock or pointing to read-only directory
+    // Alternatively, lock git index so commit fails
+    const lockPath = path.join(mainRepo, ".git", "worktrees", path.basename(info!.path), "index.lock");
+    await fs.writeFile(lockPath, "locked");
+
+    const cleanup = await cleanupWorktree(mainRepo, info!, "should fail to commit");
+    expect(cleanup.hasChanges).toBe(true);
+    expect(cleanup.preserved).toBe(false);
+    expect(cleanup.error).toBeDefined();
+
+    // Worktree folder MUST STILL EXIST on disk!
+    const stats = await fs.stat(info!.path);
+    expect(stats.isDirectory()).toBe(true);
+
+    // Clean up test lock and worktree
+    try {
+      await fs.unlink(lockPath);
+      await cleanupWorktree(mainRepo, info!, "clean after test");
+    } catch {}
+  });
 });
