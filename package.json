@@ -17,16 +17,25 @@
   "author": "arkseal",
   "license": "MIT",
   "scripts": {
-    "test": "bun test ./tests/*.test.ts"
+    "test": "bun test ./tests/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "^1.3.0",
-    "@earendil-works/pi-tui": "^1.3.0",
-    "typebox": "^1.4.2"
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
   },
   "pi": {
     "extensions": [
       "./src/index.ts"
     ]
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.5.0",
+    "@earendil-works/pi-tui": "1.5.0",
+    "@types/bun": "1.4.4",
+    "@types/node": "26.6.6",
+    "typebox": "1.4.2",
+    "typescript": "7.0.2"
   }
 }
