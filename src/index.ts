@@ -6,6 +6,8 @@ import {
   getSubagentSessionsDir,
   stopSubagent,
   stopAllSubagents,
+  shutdownSubagent,
+  shutdownAllSubagents,
   buildPiArgs,
   type SubagentModelOption,
 } from "./runner.js";
@@ -40,6 +42,8 @@ export {
   getSubagentSessionsDir,
   stopSubagent,
   stopAllSubagents,
+  shutdownSubagent,
+  shutdownAllSubagents,
   buildPiArgs,
   type SubagentModelOption,
 } from "./runner.js";
@@ -87,7 +91,7 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
-    stopAllSubagents();
+    await shutdownAllSubagents();
   });
 
   // Capture UI context and restore subagents on session lifecycle
@@ -150,7 +154,7 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
 
       // Subcommand: stop / cancel all running subagents
       if (trimmedArg === "stop" || trimmedArg === "cancel" || trimmedArg === "kill") {
-        const stopped = stopAllSubagents();
+        const stopped = await shutdownAllSubagents();
         ctx.ui.notify(stopped > 0 ? `Stopped ${stopped} running subagent(s).` : "No running subagents to stop.", "info");
         return;
       }
@@ -162,7 +166,6 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
           ? "Sidebar subagents: showing all subagents"
           : "Sidebar subagents: showing last 5 subagents";
         ctx.ui.notify(msg, "info");
-        ctx.ui.requestRender();
         return;
       }
 
@@ -206,7 +209,7 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
       }
 
       // Open native Pi-style SubagentViewer (matching Pi's fork / tree UX) as fullscreen overlay
-      await ctx.ui.custom(
+      await ctx.ui.custom<void>(
         (tui, theme, _kb, done) => {
           return new SubagentViewer({
             initialMode: target ? "transcript" : "list",
@@ -253,7 +256,6 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
         ? "Sidebar subagents: showing all subagents"
         : "Sidebar subagents: showing last 5 subagents";
       ctx.ui.notify(msg, "info");
-      ctx.ui.requestRender();
     },
   });
 
@@ -498,9 +500,11 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
         } catch {}
       }
 
+      const isFailed = result.details.status === "failed" || result.details.status === "aborted";
       return {
         content: [{ type: "text", text: result.output }],
         details: result.details,
+        isError: isFailed,
       };
     },
   });

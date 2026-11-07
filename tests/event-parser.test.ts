@@ -349,4 +349,41 @@ describe("SubagentEventParser", () => {
     expect(parser.getStats().toolCalls).toBe(0);
     expect(parser.getStats().totalTokens).toBe(0);
   });
+
+  it("captures stopReason:error and errorMessage from assistant message_end and agent_end", () => {
+    const parser = new SubagentEventParser();
+
+    parser.parseLine(
+      JSON.stringify({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [],
+          stopReason: "error",
+          errorMessage: "model_not_found: The model openai/gpt-5.4 does not exist",
+        },
+      })
+    );
+
+    expect(parser.getStopReason()).toBe("error");
+    expect(parser.getErrorMessage()).toContain("model_not_found");
+
+    const fallbackParser = new SubagentEventParser();
+    fallbackParser.parseLine(
+      JSON.stringify({
+        type: "agent_end",
+        messages: [
+          {
+            role: "assistant",
+            content: [],
+            stopReason: "error",
+            errorMessage: "provider_overloaded",
+          },
+        ],
+      })
+    );
+
+    expect(fallbackParser.getStopReason()).toBe("error");
+    expect(fallbackParser.getErrorMessage()).toBe("provider_overloaded");
+  });
 });

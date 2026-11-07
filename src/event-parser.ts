@@ -17,6 +17,8 @@ export interface ParsedEventPeek {
   lingerMs?: number;
   transcriptLine?: string;
   finalAssistantText?: string;
+  stopReason?: string;
+  errorMessage?: string;
   stats?: SubagentStats;
 }
 
@@ -27,6 +29,9 @@ export interface PendingToolCall {
 
 export class SubagentEventParser {
   private pendingCalls = new Map<string, PendingToolCall>();
+  private lastStopReason?: string;
+  private lastErrorMessage?: string;
+  private lastAssistantText?: string;
   private stats: SubagentStats = {
     tokensIn: 0,
     tokensOut: 0,
@@ -42,6 +47,9 @@ export class SubagentEventParser {
   reset(): void {
     this.pendingCalls.clear();
     this.currentTurnUsage = undefined;
+    this.lastStopReason = undefined;
+    this.lastErrorMessage = undefined;
+    this.lastAssistantText = undefined;
     this.stats = {
       tokensIn: 0,
       tokensOut: 0,
@@ -52,6 +60,18 @@ export class SubagentEventParser {
       turns: 0,
       toolCalls: 0,
     };
+  }
+
+  getStopReason(): string | undefined {
+    return this.lastStopReason;
+  }
+
+  getErrorMessage(): string | undefined {
+    return this.lastErrorMessage;
+  }
+
+  getLastAssistantText(): string | undefined {
+    return this.lastAssistantText;
   }
 
   parseLine(line: string): ParsedEventPeek | undefined {
@@ -134,6 +154,9 @@ export class SubagentEventParser {
         if (ev.message?.role === "assistant") {
           if (ev.message?.model) this.stats.model = ev.message.model;
           if (ev.message?.thinkingLevel) this.stats.thinkingLevel = ev.message.thinkingLevel;
+          if (ev.message?.stopReason) this.lastStopReason = ev.message.stopReason;
+          if (typeof ev.message?.errorMessage === "string") this.lastErrorMessage = ev.message.errorMessage;
+
           const usage = ev.message?.usage || this.currentTurnUsage;
           if (usage) {
             this.stats.tokensIn += usage.input ?? 0;
@@ -145,6 +168,27 @@ export class SubagentEventParser {
             }
             this.stats.totalTokens = this.stats.tokensIn + this.stats.tokensOut + this.stats.cacheRead + this.stats.cacheWrite;
             this.currentTurnUsage = undefined;
+          }
+
+          const messageText = Array.isArray(ev.message?.content)
+            ? ev.message.content
+                .filter((part: any) => part.type === "text" && typeof part.text === "string")
+                .map((part: any) => part.text)
+                .join("\n")
+                .trim()
+            : "";
+          if (messageText) {
+            this.lastAssistantText = messageText;
+          }
+
+          const failure = ev.message?.stopReason === "error" || ev.message?.stopReason === "aborted";
+          if (failure || messageText) {
+            return {
+              finalAssistantText: messageText || this.lastAssistantText,
+              stopReason: this.lastStopReason,
+              errorMessage: this.lastErrorMessage,
+              stats: this.getStats(),
+            };
           }
         }
       }
@@ -175,6 +219,14 @@ export class SubagentEventParser {
           this.stats.totalTokens = this.stats.tokensIn + this.stats.tokensOut + this.stats.cacheRead + this.stats.cacheWrite;
         }
 
+        const failedMessage = [...ev.messages]
+          .reverse()
+          .find((m: any) => m.role === "assistant" && (m.stopReason === "error" || m.stopReason === "aborted"));
+        if (failedMessage) {
+          if (failedMessage.stopReason) this.lastStopReason = failedMessage.stopReason;
+          if (failedMessage.errorMessage) this.lastErrorMessage = failedMessage.errorMessage;
+        }
+
         const lastMsg = [...ev.messages]
           .reverse()
           .find((m: any) => m.role === "assistant" && Array.isArray(m.content));
@@ -184,9 +236,20 @@ export class SubagentEventParser {
             .filter((c: any) => c.type === "text" && c.text)
             .map((c: any) => c.text);
           const fullText = textParts.join("\n").trim();
+          if (fullText) this.lastAssistantText = fullText;
           return {
-            finalAssistantText: fullText,
+            finalAssistantText: fullText || this.lastAssistantText,
             transcriptLine: fullText,
+            stopReason: this.lastStopReason,
+            errorMessage: this.lastErrorMessage,
+            stats: this.getStats(),
+          };
+        }
+
+        if (this.lastStopReason || this.lastErrorMessage) {
+          return {
+            stopReason: this.lastStopReason,
+            errorMessage: this.lastErrorMessage,
             stats: this.getStats(),
           };
         }

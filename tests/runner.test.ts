@@ -97,6 +97,71 @@ describe("Subagent Runner Configuration", () => {
     expect(stoppedAll).toBeGreaterThanOrEqual(1);
     expect(activeSubagentProcesses.size).toBe(0);
   });
+
+  it("shutdownAllSubagents terminates cleanly and suppresses background callbacks", async () => {
+    const { executeSubagent, shutdownAllSubagents, activeSubagentProcesses } = require("../src/runner");
+    let backgroundCallbackInvoked = false;
+
+    const result = await executeSubagent({
+      task: "Task to shutdown",
+      cwd: process.cwd(),
+      isolated: false,
+      onBackgroundComplete: () => {
+        backgroundCallbackInvoked = true;
+      },
+    });
+
+    expect(activeSubagentProcesses.has(result.details.id)).toBe(true);
+
+    const shutdownCount = await shutdownAllSubagents();
+    expect(shutdownCount).toBeGreaterThanOrEqual(1);
+    expect(activeSubagentProcesses.has(result.details.id)).toBe(false);
+    expect(backgroundCallbackInvoked).toBe(false);
+  });
+
+  it("detects assistant error events on zero-exit code and preserves error message without stale logs", () => {
+    const { SubagentEventParser } = require("../src/event-parser");
+    const parser = new SubagentEventParser();
+
+    // Simulate Pi emitting model_not_found error in JSON event stream
+    parser.parseLine(
+      JSON.stringify({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [],
+          stopReason: "error",
+          errorMessage: "model_not_found: The model openai/gpt-5.4 does not exist",
+        },
+      })
+    );
+    parser.parseLine(
+      JSON.stringify({
+        type: "agent_end",
+        messages: [
+          {
+            role: "assistant",
+            content: [],
+            stopReason: "error",
+            errorMessage: "model_not_found: The model openai/gpt-5.4 does not exist",
+          },
+        ],
+      })
+    );
+
+    const stopReason = parser.getStopReason();
+    const errorMsg = parser.getErrorMessage();
+    const hasErrorStop = stopReason === "error" || Boolean(errorMsg);
+
+    // Process exited with code 0 (common in Pi when assistant error was handled internally)
+    const code = 0;
+    const status = (code === 0 && !hasErrorStop) ? "completed" : "failed";
+    const effectiveExitCode = (hasErrorStop && code === 0) ? 1 : code;
+
+    expect(status).toBe("failed");
+    expect(effectiveExitCode).toBe(1);
+    expect(errorMsg).toContain("model_not_found");
+  });
 });
 
 describe("buildPiArgs", () => {

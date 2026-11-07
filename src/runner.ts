@@ -22,10 +22,29 @@ export interface ActiveSubagentHandle {
   abortHandler?: () => void;
   signal?: AbortSignal;
   isAborted?: boolean;
+  suppressCallbacks?: boolean;
 }
 
 export const activeSubagentHandles = new Map<string, ActiveSubagentHandle>();
 export const activeSubagentProcesses = new Map<string, ChildProcess>();
+
+export async function waitForProcessExit(child: ChildProcess, timeoutMs = 2500): Promise<void> {
+  if (!child || child.killed || child.exitCode !== null) return;
+  await new Promise<void>((resolve) => {
+    let resolved = false;
+    const done = () => {
+      if (!resolved) {
+        resolved = true;
+        clearTimeout(timer);
+        resolve();
+      }
+    };
+    const timer = setTimeout(done, timeoutMs);
+    child.once("close", done);
+    child.once("exit", done);
+    child.once("error", done);
+  });
+}
 
 export function killProcessGroup(child: ChildProcess): void {
   if (!child || child.killed) return;
@@ -75,6 +94,7 @@ export function stopSubagent(id: string): boolean {
 
   if (handle) {
     handle.isAborted = true;
+    handle.suppressCallbacks = true;
     if (handle.signal && handle.abortHandler) {
       handle.signal.removeEventListener("abort", handle.abortHandler);
     }
@@ -100,6 +120,43 @@ export function stopSubagent(id: string): boolean {
   return true;
 }
 
+export async function shutdownSubagent(id: string, timeoutMs = 2500): Promise<boolean> {
+  const handle = activeSubagentHandles.get(id);
+  const child = handle?.child ?? activeSubagentProcesses.get(id);
+  if (!child && !handle) return false;
+
+  if (handle) {
+    handle.isAborted = true;
+    handle.suppressCallbacks = true;
+    if (handle.signal && handle.abortHandler) {
+      handle.signal.removeEventListener("abort", handle.abortHandler);
+    }
+    if (handle.logFd !== undefined) {
+      try {
+        fsSync.closeSync(handle.logFd);
+      } catch {}
+      handle.logFd = undefined;
+    }
+  }
+
+  if (child && !child.killed && child.exitCode === null) {
+    killProcessGroup(child);
+    await waitForProcessExit(child, timeoutMs);
+  }
+
+  if (handle?.worktreeInfo) {
+    try {
+      await cleanupWorktree(handle.cwd, handle.worktreeInfo, "shutdown subagent");
+    } catch {}
+    handle.worktreeInfo = undefined;
+  }
+
+  activeSubagentProcesses.delete(id);
+  activeSubagentHandles.delete(id);
+  globalSubagentTracker.registerFinish(id, { status: "aborted", exitCode: 130 });
+  return true;
+}
+
 export function stopAllSubagents(): number {
   let count = 0;
   const allIds = Array.from(new Set([...activeSubagentHandles.keys(), ...activeSubagentProcesses.keys()]));
@@ -108,6 +165,22 @@ export function stopAllSubagents(): number {
       count++;
     }
   }
+  activeSubagentProcesses.clear();
+  activeSubagentHandles.clear();
+  globalSubagentTracker.stopAll();
+  return count;
+}
+
+export async function shutdownAllSubagents(timeoutMs = 2500): Promise<number> {
+  let count = 0;
+  const allIds = Array.from(new Set([...activeSubagentHandles.keys(), ...activeSubagentProcesses.keys()]));
+  await Promise.all(
+    allIds.map(async (id) => {
+      if (await shutdownSubagent(id, timeoutMs)) {
+        count++;
+      }
+    })
+  );
   activeSubagentProcesses.clear();
   activeSubagentHandles.clear();
   globalSubagentTracker.stopAll();
@@ -169,6 +242,9 @@ export function buildPiArgs(options: {
 }
 
 export interface SpawnSubagentOptions {
+  cwd: string;
+  isolated?: boolean;
+  currentDepth?: number;
   task?: string;
   prompt?: string; // alias for task
   description?: string;
@@ -188,6 +264,8 @@ export interface SpawnSubagentOptions {
     durationMs: number;
     summary: string;
     stats?: any;
+    model?: string;
+    reasoning?: string;
     logFile?: string;
     worktree?: any;
   }) => void;
@@ -261,12 +339,14 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
   }
 
   const actuallyIsolated = Boolean(worktreeInfo);
+  const initialLogSize = fsSync.existsSync(logFile) ? fsSync.statSync(logFile).size : 0;
   let logFd: number | undefined = fsSync.openSync(logFile, "a");
 
   let lastLine = "";
   let aborted = false;
   let lineBuffer = "";
   let lastAssistantText = "";
+  let stderrText = "";
   const parser = new SubagentEventParser();
 
   // Assemble CLI arguments for the Pi subagent process
@@ -397,7 +477,55 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
   };
 
   child.stdout?.on("data", handleChunk);
-  child.stderr?.on("data", handleChunk);
+  child.stderr?.on("data", (chunk: Buffer) => {
+    stderrText += chunk.toString("utf-8");
+    handleChunk(chunk);
+  });
+
+  const buildResultSummary = (code: number, exitStatus: string): string => {
+    const stopReason = parser.getStopReason();
+    const errorMsg = parser.getErrorMessage();
+
+    if (exitStatus === "failed") {
+      if (errorMsg) return `Error: ${errorMsg}`;
+      if (lastAssistantText) return lastAssistantText;
+      const stderrLines = stderrText
+        .trim()
+        .split("\n")
+        .map((l) => l.trim())
+        .filter(Boolean);
+      if (stderrLines.length > 0) {
+        return `Error: ${stderrLines.slice(-5).join("\n")}`;
+      }
+      return stopReason ? `Subagent failed with stopReason: ${stopReason}` : `Subagent exited with code ${code}`;
+    }
+
+    if (lastAssistantText) return lastAssistantText;
+
+    // Read only lines appended during this run from logFile
+    try {
+      if (fsSync.existsSync(logFile)) {
+        const fileStat = fsSync.statSync(logFile);
+        const readBytes = Math.max(0, fileStat.size - initialLogSize);
+        if (readBytes > 0) {
+          const buf = Buffer.alloc(readBytes);
+          const fd = fsSync.openSync(logFile, "r");
+          try {
+            fsSync.readSync(fd, buf, 0, readBytes, initialLogSize);
+            const rawOutput = buf.toString("utf-8");
+            const lines = rawOutput.trim().split("\n").filter(Boolean);
+            const humanLines = lines.filter((l) => !l.startsWith("{"));
+            const tail = humanLines.slice(-10).join("\n").trim();
+            if (tail) return tail;
+          } finally {
+            fsSync.closeSync(fd);
+          }
+        }
+      }
+    } catch {}
+
+    return "(Subagent finished with no output)";
+  };
 
   // Background Execution Mode (defaults to true: non-blocking)
   const isBackground = options.background !== false;
@@ -420,6 +548,10 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
       if (finished) return;
       finished = true;
 
+      if (handle.suppressCallbacks) {
+        return;
+      }
+
       if (options.signal && abortHandler) {
         options.signal.removeEventListener("abort", abortHandler);
       }
@@ -438,16 +570,15 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
       }
 
       const durationMs = Date.now() - startTime;
-      let summary = lastAssistantText;
-      if (!summary) {
-        try {
-          const rawOutput = await fs.readFile(logFile, "utf-8");
-          const lines = rawOutput.trim().split("\n");
-          summary = lines.slice(-20).join("\n").trim() || "(Subagent finished with no output)";
-        } catch {
-          summary = `Subagent exited with code ${code}`;
-        }
-      }
+      const stopReason = parser.getStopReason();
+      const errorMsg = parser.getErrorMessage();
+      const hasErrorStop = stopReason === "error" || Boolean(errorMsg);
+      const hasAbortedStop = stopReason === "aborted";
+
+      const isSubagentAborted = aborted || handle.isAborted || hasAbortedStop;
+      const status = isSubagentAborted ? "aborted" : (code === 0 && !hasErrorStop) ? "completed" : "failed";
+      const effectiveExitCode = isSubagentAborted ? 130 : (hasErrorStop && code === 0) ? 1 : code;
+      const summary = buildResultSummary(effectiveExitCode, status);
 
       let cleanupDetails;
       if (worktreeInfo) {
@@ -457,14 +588,12 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
         } catch {}
       }
 
-      const isSubagentAborted = aborted || handle.isAborted;
-      const status = isSubagentAborted ? "aborted" : code === 0 ? "completed" : "failed";
       const stats = parser.getStats();
 
       try {
         globalSubagentTracker.registerFinish(id, {
           status,
-          exitCode: isSubagentAborted ? 130 : code,
+          exitCode: effectiveExitCode,
           durationMs,
           stats,
         });
@@ -609,16 +738,15 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
   });
 
   const durationMs = Date.now() - startTime;
-  let summary = lastAssistantText;
-  if (!summary) {
-    try {
-      const rawOutput = await fs.readFile(logFile, "utf-8");
-      const lines = rawOutput.trim().split("\n");
-      summary = lines.slice(-20).join("\n").trim() || "(Subagent finished with no output)";
-    } catch {
-      summary = `Subagent exited with code ${exitCode}`;
-    }
-  }
+  const stopReason = parser.getStopReason();
+  const errorMsg = parser.getErrorMessage();
+  const hasErrorStop = stopReason === "error" || Boolean(errorMsg);
+  const hasAbortedStop = stopReason === "aborted";
+
+  const isSubagentAborted = aborted || handle.isAborted || hasAbortedStop;
+  const status = isSubagentAborted ? "aborted" : (exitCode === 0 && !hasErrorStop) ? "completed" : "failed";
+  const effectiveExitCode = isSubagentAborted ? 130 : (hasErrorStop && exitCode === 0) ? 1 : exitCode;
+  const summary = buildResultSummary(effectiveExitCode, status);
 
   let cleanupDetails;
   if (worktreeInfo) {
@@ -628,13 +756,11 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
     } catch {}
   }
 
-  const isSubagentAborted = aborted || handle.isAborted;
-  const status = isSubagentAborted ? "aborted" : exitCode === 0 ? "completed" : "failed";
   const stats = parser.getStats();
 
   globalSubagentTracker.registerFinish(id, {
     status,
-    exitCode: isSubagentAborted ? 130 : exitCode,
+    exitCode: effectiveExitCode,
     durationMs,
     stats,
   });
