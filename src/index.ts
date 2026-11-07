@@ -41,6 +41,11 @@ import {
   BUILTIN_AGENTS,
   type AgentProfile,
 } from "./agents.js";
+import {
+  installSubagentForkSupport,
+  findSubagentTurnEndEntryId,
+  formatSubagentForkLabel,
+} from "./fork-compat.js";
 
 export {
   executeSubagent,
@@ -79,8 +84,14 @@ export {
   BUILTIN_AGENTS,
   type AgentProfile,
 } from "./agents.js";
+export {
+  installSubagentForkSupport,
+  findSubagentTurnEndEntryId,
+  formatSubagentForkLabel,
+} from "./fork-compat.js";
 
 export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
+  installSubagentForkSupport();
   // Register custom message renderers for subagent stats & responses in main chat
   if (typeof (pi as any).registerMessageRenderer === "function") {
     (pi as any).registerMessageRenderer("subagent-stats", renderSubagentStatsMessage);
