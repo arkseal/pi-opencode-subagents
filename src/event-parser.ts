@@ -81,6 +81,29 @@ export class SubagentEventParser {
     try {
       const ev = JSON.parse(trimmed);
 
+      // 0. Auto retry events
+      if (ev.type === "auto_retry_start") {
+        this.lastStopReason = undefined;
+        this.lastErrorMessage = undefined;
+        const attempt = ev.attempt ?? 1;
+        const max = ev.maxAttempts ? `/${ev.maxAttempts}` : "";
+        return {
+          peek: `retrying (attempt ${attempt}${max})...`,
+          priority: "normal",
+          lingerMs: 2000,
+        };
+      }
+
+      if (ev.type === "auto_retry_end") {
+        if (ev.success === false && ev.finalError) {
+          this.lastStopReason = "error";
+          this.lastErrorMessage = ev.finalError;
+        } else if (ev.success === true) {
+          this.lastStopReason = undefined;
+          this.lastErrorMessage = undefined;
+        }
+      }
+
       // 1. Tool execution started
       if (ev.type === "tool_execution_start") {
         this.stats.toolCalls++;
@@ -145,6 +168,8 @@ export class SubagentEventParser {
       if (ev.type === "message_start") {
         if (ev.message?.role === "assistant") {
           this.currentTurnUsage = undefined;
+          this.lastStopReason = undefined;
+          this.lastErrorMessage = undefined;
           if (ev.message?.model) this.stats.model = ev.message.model;
           if (ev.message?.thinkingLevel) this.stats.thinkingLevel = ev.message.thinkingLevel;
         }
@@ -154,8 +179,15 @@ export class SubagentEventParser {
         if (ev.message?.role === "assistant") {
           if (ev.message?.model) this.stats.model = ev.message.model;
           if (ev.message?.thinkingLevel) this.stats.thinkingLevel = ev.message.thinkingLevel;
-          if (ev.message?.stopReason) this.lastStopReason = ev.message.stopReason;
-          if (typeof ev.message?.errorMessage === "string") this.lastErrorMessage = ev.message.errorMessage;
+          if (ev.message?.stopReason === "error" || ev.message?.stopReason === "aborted") {
+            this.lastStopReason = ev.message.stopReason;
+            if (typeof ev.message?.errorMessage === "string") {
+              this.lastErrorMessage = ev.message.errorMessage;
+            }
+          } else if (ev.message?.stopReason) {
+            this.lastStopReason = ev.message.stopReason;
+            this.lastErrorMessage = undefined;
+          }
 
           const usage = ev.message?.usage || this.currentTurnUsage;
           if (usage) {
@@ -199,51 +231,63 @@ export class SubagentEventParser {
       }
 
       // 6. Agent ended (capture final assistant response & fallback token counting)
-      if (ev.type === "agent_end" && Array.isArray(ev.messages)) {
+      if (ev.type === "agent_end") {
+        if (ev.willRetry === true) {
+          return undefined;
+        }
+
         this.pendingCalls.clear();
         this.currentTurnUsage = undefined;
-        if (this.stats.totalTokens === 0) {
-          for (const msg of ev.messages) {
-            if (msg.role === "assistant" && msg.usage) {
-              if (msg.model && !this.stats.model) this.stats.model = msg.model;
-              if (msg.thinkingLevel && !this.stats.thinkingLevel) this.stats.thinkingLevel = msg.thinkingLevel;
-              this.stats.tokensIn += msg.usage.input ?? 0;
-              this.stats.tokensOut += msg.usage.output ?? 0;
-              this.stats.cacheRead += msg.usage.cacheRead ?? 0;
-              this.stats.cacheWrite += msg.usage.cacheWrite ?? 0;
-              if (typeof msg.usage.cost?.total === "number") {
-                this.stats.cost = (this.stats.cost ?? 0) + msg.usage.cost.total;
+        if (Array.isArray(ev.messages)) {
+          if (this.stats.totalTokens === 0) {
+            for (const msg of ev.messages) {
+              if (msg.role === "assistant" && msg.usage) {
+                if (msg.model && !this.stats.model) this.stats.model = msg.model;
+                if (msg.thinkingLevel && !this.stats.thinkingLevel) this.stats.thinkingLevel = msg.thinkingLevel;
+                this.stats.tokensIn += msg.usage.input ?? 0;
+                this.stats.tokensOut += msg.usage.output ?? 0;
+                this.stats.cacheRead += msg.usage.cacheRead ?? 0;
+                this.stats.cacheWrite += msg.usage.cacheWrite ?? 0;
+                if (typeof msg.usage.cost?.total === "number") {
+                  this.stats.cost = (this.stats.cost ?? 0) + msg.usage.cost.total;
+                }
               }
             }
+            this.stats.totalTokens = this.stats.tokensIn + this.stats.tokensOut + this.stats.cacheRead + this.stats.cacheWrite;
           }
-          this.stats.totalTokens = this.stats.tokensIn + this.stats.tokensOut + this.stats.cacheRead + this.stats.cacheWrite;
-        }
 
-        const failedMessage = [...ev.messages]
-          .reverse()
-          .find((m: any) => m.role === "assistant" && (m.stopReason === "error" || m.stopReason === "aborted"));
-        if (failedMessage) {
-          if (failedMessage.stopReason) this.lastStopReason = failedMessage.stopReason;
-          if (failedMessage.errorMessage) this.lastErrorMessage = failedMessage.errorMessage;
-        }
+          const assistantMessages = ev.messages.filter((m: any) => m.role === "assistant");
+          const lastAssistant = assistantMessages[assistantMessages.length - 1];
+          if (lastAssistant) {
+            if (lastAssistant.stopReason === "error" || lastAssistant.stopReason === "aborted") {
+              this.lastStopReason = lastAssistant.stopReason;
+              this.lastErrorMessage = lastAssistant.errorMessage;
+            } else {
+              if (lastAssistant.stopReason) {
+                this.lastStopReason = lastAssistant.stopReason;
+              }
+              this.lastErrorMessage = undefined;
+            }
+          }
 
-        const lastMsg = [...ev.messages]
-          .reverse()
-          .find((m: any) => m.role === "assistant" && Array.isArray(m.content));
+          const lastMsg = [...ev.messages]
+            .reverse()
+            .find((m: any) => m.role === "assistant" && Array.isArray(m.content));
 
-        if (lastMsg) {
-          const textParts = lastMsg.content
-            .filter((c: any) => c.type === "text" && c.text)
-            .map((c: any) => c.text);
-          const fullText = textParts.join("\n").trim();
-          if (fullText) this.lastAssistantText = fullText;
-          return {
-            finalAssistantText: fullText || this.lastAssistantText,
-            transcriptLine: fullText,
-            stopReason: this.lastStopReason,
-            errorMessage: this.lastErrorMessage,
-            stats: this.getStats(),
-          };
+          if (lastMsg) {
+            const textParts = lastMsg.content
+              .filter((c: any) => c.type === "text" && c.text)
+              .map((c: any) => c.text);
+            const fullText = textParts.join("\n").trim();
+            if (fullText) this.lastAssistantText = fullText;
+            return {
+              finalAssistantText: fullText || this.lastAssistantText,
+              transcriptLine: fullText,
+              stopReason: this.lastStopReason,
+              errorMessage: this.lastErrorMessage,
+              stats: this.getStats(),
+            };
+          }
         }
 
         if (this.lastStopReason || this.lastErrorMessage) {

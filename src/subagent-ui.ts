@@ -401,12 +401,27 @@ export function renderSubagentResponseMessage(
 ) {
   const isExpanded = Boolean(options?.expanded);
   const details = message?.details || {};
-  const isError = details.status === "failed" || details.status === "aborted";
+  const isFailed = details.status === "failed";
+  const isAborted = details.status === "aborted";
+  const isError = isFailed || isAborted;
   const durationSec = details.durationMs ? (details.durationMs / 1000).toFixed(1) : undefined;
   const statusIcon = isError ? theme.fg("error", "▲") : theme.fg("success", "●");
   const agentLabel = details.agent ? ` · ${theme.fg("muted", details.agent)}` : "";
 
-  let header = `${statusIcon} ${theme.bold(theme.fg("toolTitle", "Subagent completed"))} ${theme.fg("accent", `[${details.id || "subagent"}]`)}${agentLabel}`;
+  let headerTitle: string;
+  let bgKey: string;
+  if (isFailed) {
+    headerTitle = theme.bold(theme.fg("error", "Subagent failed"));
+    bgKey = "toolErrorBg";
+  } else if (isAborted) {
+    headerTitle = theme.bold(theme.fg("error", "Subagent aborted"));
+    bgKey = "toolErrorBg";
+  } else {
+    headerTitle = theme.bold(theme.fg("toolTitle", "Subagent completed"));
+    bgKey = "toolSuccessBg";
+  }
+
+  let header = `${statusIcon} ${headerTitle} ${theme.fg("accent", `[${details.id || "subagent"}]`)}${agentLabel}`;
   if (durationSec) {
     header += ` ${theme.fg("dim", `in ${durationSec}s`)}`;
   }
@@ -453,7 +468,7 @@ export function renderSubagentResponseMessage(
   }
 
   const pad = options?.outputPad ?? 1;
-  const box = new Box(pad, 0, (t) => theme.bg("toolSuccessBg", t));
+  const box = new Box(pad, 0, (t) => theme.bg(bgKey, t));
   const sanitizedText = preserveBg(lines.join("\n"));
   box.addChild(new Text(sanitizedText, 0, 0));
   return box;

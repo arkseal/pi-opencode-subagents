@@ -18,6 +18,7 @@ export function checkSubagentCompletionOnDisk(
   logFilePath?: string
 ): {
   status: "completed" | "failed" | "aborted" | "running";
+  errorMessage?: string;
   stats?: SubagentStats;
   durationMs?: number;
 } {
@@ -25,7 +26,9 @@ export function checkSubagentCompletionOnDisk(
     const sessionsDir = getSubagentSessionsDir();
     if (fs.existsSync(sessionsDir)) {
       const files = fs.readdirSync(sessionsDir);
-      const match = files.find((f) => f.includes(id) && f.endsWith(".jsonl"));
+      const match = files.find(
+        (f) => (f === `${id}.jsonl` || f.endsWith(`_${id}.jsonl`) || f.includes(id)) && f.endsWith(".jsonl")
+      );
       if (match) {
         const fullPath = path.join(sessionsDir, match);
         const content = fs.readFileSync(fullPath, "utf-8");
@@ -40,17 +43,34 @@ export function checkSubagentCompletionOnDisk(
           })
           .filter(Boolean);
 
-        const hasAssistant = entries.some(
-          (e) =>
-            e.type === "message" &&
-            e.message?.role === "assistant" &&
-            e.message?.content?.some((c: any) => c.type === "text" && c.text)
+        const assistantEntries = entries.filter(
+          (e) => e.type === "message" && e.message?.role === "assistant"
         );
-        const hasSessionInfo = entries.some((e) => e.type === "session_info");
 
-        if (hasAssistant || hasSessionInfo) {
-          return { status: "completed" };
+        if (assistantEntries.length > 0) {
+          const lastEntry = assistantEntries[assistantEntries.length - 1];
+          const lastMsg = lastEntry.message;
+          if (lastMsg?.stopReason === "error") {
+            return {
+              status: "failed",
+              errorMessage: lastMsg.errorMessage || "Subagent assistant error",
+            };
+          }
+          if (lastMsg?.stopReason === "aborted") {
+            return { status: "aborted" };
+          }
+          const hasCompletedContent =
+            lastMsg?.content?.some(
+              (c: any) => (c.type === "text" && c.text) || c.type === "toolCall"
+            ) ||
+            lastMsg?.stopReason === "stop" ||
+            lastMsg?.stopReason === "toolUse";
+          if (hasCompletedContent) {
+            return { status: "completed" };
+          }
         }
+
+        return { status: "failed" };
       }
     }
   } catch {}
@@ -78,6 +98,8 @@ export interface TrackedSubagent {
   logFile: string;
   exitCode?: number;
   stats?: SubagentStats;
+  errorMessage?: string;
+  summary?: string;
 }
 
 class PinnedSubagentsWidget implements Component {
@@ -92,7 +114,8 @@ class PinnedSubagentsWidget implements Component {
     if (items.length === 0) return [];
 
     const runningCount = items.filter((s) => s.status === "running").length;
-    const completedCount = items.length - runningCount;
+    const completedCount = items.filter((s) => s.status === "completed").length;
+    const failedCount = items.filter((s) => s.status === "failed" || s.status === "aborted").length;
     const spinner = this.theme.fg("accent", SPINNER_FRAMES[this.tracker.getFrameIndex()]);
 
     const lines: string[] = [];
@@ -100,7 +123,10 @@ class PinnedSubagentsWidget implements Component {
 
     // 1. Clean Top Divider
     const title = "Subagents";
-    const countStr = `(${runningCount} running${completedCount > 0 ? ` · ${completedCount} done` : ""})`;
+    const countParts: string[] = [`${runningCount} running`];
+    if (completedCount > 0) countParts.push(`${completedCount} done`);
+    if (failedCount > 0) countParts.push(`${failedCount} failed`);
+    const countStr = `(${countParts.join(" · ")})`;
     const header = `${this.theme.bold(this.theme.fg("accent", title))} ${this.theme.fg("muted", countStr)}`;
     const lineLen = Math.max(2, boxWidth - visibleWidth(header) - 3);
     lines.push(`${this.theme.fg("dim", "──")} ${header} ${this.theme.fg("dim", "─".repeat(lineLen))}`);
@@ -366,14 +392,36 @@ export class SubagentTracker {
     this.notifyRender();
   }
 
-  registerFinish(id: string, result: { status: "completed" | "failed" | "aborted"; exitCode?: number; durationMs?: number; stats?: SubagentStats }) {
+  registerFinish(
+    id: string,
+    result: {
+      status: "completed" | "failed" | "aborted";
+      exitCode?: number;
+      durationMs?: number;
+      stats?: SubagentStats;
+      errorMessage?: string;
+      summary?: string;
+    }
+  ) {
+    const formatFinishLine = (status: string, exitCode?: number, errorMessage?: string) => {
+      if (status === "completed") return "Done";
+      if (status === "aborted") return "Aborted";
+      if (errorMessage) {
+        const firstLine = errorMessage.split("\n")[0].trim();
+        return firstLine.startsWith("Error:") ? firstLine : `Error: ${firstLine}`;
+      }
+      return `Exited with code ${exitCode ?? 1}`;
+    };
+
     const item = this.active.get(id);
     if (item) {
       item.status = result.status;
       item.exitCode = result.exitCode;
       item.endTime = Date.now();
       item.durationMs = result.durationMs ?? (item.endTime - item.startTime);
-      item.currentLine = result.status === "completed" ? "Done" : `Exited with code ${result.exitCode ?? 1}`;
+      if (result.errorMessage) item.errorMessage = result.errorMessage;
+      if (result.summary) item.summary = result.summary;
+      item.currentLine = formatFinishLine(result.status, result.exitCode, result.errorMessage);
       if (result.stats) {
         item.stats = result.stats;
       }
@@ -386,7 +434,9 @@ export class SubagentTracker {
         existing.exitCode = result.exitCode;
         existing.endTime = Date.now();
         existing.durationMs = result.durationMs ?? (existing.endTime - existing.startTime);
-        existing.currentLine = result.status === "completed" ? "Done" : `Exited with code ${result.exitCode ?? 1}`;
+        if (result.errorMessage) existing.errorMessage = result.errorMessage;
+        if (result.summary) existing.summary = result.summary;
+        existing.currentLine = formatFinishLine(result.status, result.exitCode, result.errorMessage);
         if (result.stats) existing.stats = result.stats;
       }
     }
@@ -462,7 +512,14 @@ export class SubagentTracker {
         const diskCheck = checkSubagentCompletionOnDisk(id, item.logFile);
         if (diskCheck.status !== "running") {
           item.status = diskCheck.status;
-          item.currentLine = diskCheck.status === "completed" ? "Done" : "Aborted";
+          if (diskCheck.status === "completed") {
+            item.currentLine = "Done";
+          } else if (diskCheck.status === "aborted") {
+            item.currentLine = "Aborted";
+          } else {
+            item.currentLine = diskCheck.errorMessage ? `Error: ${diskCheck.errorMessage}` : "Failed";
+          }
+          if (diskCheck.errorMessage) item.errorMessage = diskCheck.errorMessage;
           if (diskCheck.durationMs && !item.durationMs) item.durationMs = diskCheck.durationMs;
           if (diskCheck.stats && !item.stats) item.stats = diskCheck.stats;
         }
@@ -644,6 +701,7 @@ export class SubagentTracker {
         // Accurate counts across ALL subagents that have run
         const totalRunning = allItems.filter((s) => s.status === "running").length;
         const totalCompleted = allItems.filter((s) => s.status === "completed").length;
+        const totalFailed = allItems.filter((s) => s.status === "failed" || s.status === "aborted").length;
         const lines: string[] = [];
         const rowMap = new Map<number, string>();
 
@@ -672,11 +730,21 @@ export class SubagentTracker {
         const currentSpinner = SPINNER_FRAMES[currentFrameIndex];
 
         // Header line with accurate total counts
-        const countLabel = totalRunning > 0
-          ? dim(` (${totalRunning} active${totalCompleted > 0 ? `, ${totalCompleted} done` : ""})`)
-          : totalCompleted > 0
-            ? fg("success", ` (${totalCompleted} done)`)
-            : "";
+        let countLabel = "";
+        if (totalRunning > 0) {
+          const parts = [`${totalRunning} active`];
+          if (totalCompleted > 0) parts.push(`${totalCompleted} done`);
+          if (totalFailed > 0) parts.push(`${totalFailed} failed`);
+          countLabel = dim(` (${parts.join(", ")})`);
+        } else if (totalCompleted > 0 || totalFailed > 0) {
+          if (totalCompleted > 0 && totalFailed === 0) {
+            countLabel = fg("success", ` (${totalCompleted} done)`);
+          } else if (totalFailed > 0 && totalCompleted === 0) {
+            countLabel = fg("error", ` (${totalFailed} failed)`);
+          } else {
+            countLabel = dim(" (") + fg("success", `${totalCompleted} done`) + dim(", ") + fg("error", `${totalFailed} failed`) + dim(")");
+          }
+        }
         lines.push(bold(" Subagents") + countLabel);
         lines.push(dim("─".repeat(Math.max(0, safeW))));
 

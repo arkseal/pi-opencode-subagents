@@ -980,6 +980,8 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
           exitCode: effectiveExitCode,
           durationMs,
           stats,
+          errorMessage: spawnError ? `Failed to spawn subagent process: ${spawnError}` : (errorMsg || (status === "failed" ? summary : undefined)),
+          summary,
         });
       } catch {}
 
@@ -1152,6 +1154,8 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
     exitCode: effectiveExitCode,
     durationMs,
     stats,
+    errorMessage: spawnError ? `Failed to spawn subagent process: ${spawnError}` : (errorMsg || (status === "failed" ? summary : undefined)),
+    summary,
   });
 
   const envelope = formatSubagentEnvelope({
