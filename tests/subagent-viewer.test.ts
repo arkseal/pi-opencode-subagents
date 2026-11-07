@@ -371,4 +371,266 @@ describe("SubagentViewer", () => {
       } catch {}
     }
   });
+
+  it("expands and collapses tool outputs with ctrl+o", () => {
+    const subId = "sub_tool_expand_test";
+    const sessionsDir = path.join(os.homedir(), ".pi", "agent", "subagents", "sessions");
+    if (!fs.existsSync(sessionsDir)) {
+      fs.mkdirSync(sessionsDir, { recursive: true });
+    }
+    const jsonlFile = path.join(sessionsDir, `2026-10-25T00-00-00-000Z_${subId}.jsonl`);
+
+    const manyLines = Array.from({ length: 25 }, (_, i) => `log line ${i + 1}`).join("\n");
+    const entries = [
+      { type: "session", id: subId },
+      {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "toolCall", id: "tc_bash_long", name: "bash", arguments: { command: "cat long.txt" } },
+          ],
+        },
+      },
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolCallId: "tc_bash_long",
+          toolName: "bash",
+          content: [{ type: "text", text: manyLines }],
+        },
+      },
+    ];
+
+    fs.writeFileSync(jsonlFile, entries.map((e) => JSON.stringify(e)).join("\n"));
+
+    try {
+      const tracker = new SubagentTracker();
+      tracker.registerStart({
+        id: subId,
+        task: "Long output test",
+        logFile: tmpLog,
+      });
+
+      const viewer = new SubagentViewer({
+        id: subId,
+        initialMode: "transcript",
+        theme: mockTheme,
+        tui: { requestRender: () => {} },
+        tracker,
+        done: () => {},
+      });
+
+      // Default: collapsed preview with ctrl+o hint
+      let rendered = viewer.render(80).join("\n");
+      expect(rendered).toContain("ctrl+o to expand");
+      expect(rendered).not.toContain("log line 24");
+
+      // Press ctrl+o (\x0f) to expand
+      viewer.handleInput("\x0f");
+      rendered = viewer.render(80).join("\n");
+      expect(rendered).toContain("log line 24");
+
+      // Press ctrl+o again to collapse
+      viewer.handleInput("\x0f");
+      rendered = viewer.render(80).join("\n");
+      expect(rendered).toContain("ctrl+o to expand");
+    } finally {
+      try {
+        fs.unlinkSync(jsonlFile);
+      } catch {}
+    }
+  });
+
+  it("hides and reveals thinking block with alt+t and ctrl+t", () => {
+    const subId = "sub_thinking_test";
+    const sessionsDir = path.join(os.homedir(), ".pi", "agent", "subagents", "sessions");
+    if (!fs.existsSync(sessionsDir)) {
+      fs.mkdirSync(sessionsDir, { recursive: true });
+    }
+    const jsonlFile = path.join(sessionsDir, `2026-10-25T00-00-00-000Z_${subId}.jsonl`);
+
+    const entries = [
+      { type: "session", id: subId },
+      {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "Deep architectural reasoning about state machines." },
+            { type: "text", text: "Ready to proceed." },
+          ],
+        },
+      },
+    ];
+
+    fs.writeFileSync(jsonlFile, entries.map((e) => JSON.stringify(e)).join("\n"));
+
+    try {
+      const tracker = new SubagentTracker();
+      tracker.registerStart({
+        id: subId,
+        task: "Thinking test",
+        logFile: tmpLog,
+      });
+
+      const viewer = new SubagentViewer({
+        id: subId,
+        initialMode: "transcript",
+        theme: mockTheme,
+        tui: { requestRender: () => {} },
+        tracker,
+        done: () => {},
+      });
+
+      // Initially thinking is visible
+      let rendered = viewer.render(80).join("\n");
+      expect(rendered).toContain("Deep architectural reasoning");
+
+      // Toggle off with alt+t (\x1bt)
+      viewer.handleInput("\x1bt");
+      rendered = viewer.render(80).join("\n");
+      expect(rendered).toContain("Thinking... (press alt+t to expand)");
+      expect(rendered).not.toContain("Deep architectural reasoning");
+
+      // Toggle back on with ctrl+t (\x14)
+      viewer.handleInput("\x14");
+      rendered = viewer.render(80).join("\n");
+      expect(rendered).toContain("Deep architectural reasoning");
+    } finally {
+      try {
+        fs.unlinkSync(jsonlFile);
+      } catch {}
+    }
+  });
+
+  it("focuses input dock on i, accepts typing, and steers running subagent on Enter", () => {
+    const { PassThrough } = require("node:stream");
+    const { activeSubagentHandles, activeSubagentProcesses, stopAllSubagents } = require("../src/runner");
+    const { SubagentEventParser } = require("../src/event-parser");
+
+    stopAllSubagents();
+    const mockStdin = new PassThrough();
+    let written = "";
+    mockStdin.on("data", (chunk: Buffer) => {
+      written += chunk.toString("utf-8");
+    });
+
+    const mockChild: any = {
+      stdin: mockStdin,
+      killed: false,
+      exitCode: null,
+      pid: 8888,
+      kill: () => {},
+      once: () => {},
+    };
+
+    const handle: any = {
+      id: "sub_interactive_steer",
+      child: mockChild,
+      cwd: process.cwd(),
+      taskText: "Running task",
+      logFile: tmpLog,
+      parser: new SubagentEventParser(),
+      sessionFile: "/tmp/s.jsonl",
+      useRpc: true,
+      pendingSteers: 0,
+      steeredMessages: [],
+    };
+
+    activeSubagentHandles.set("sub_interactive_steer", handle);
+    activeSubagentProcesses.set("sub_interactive_steer", mockChild);
+
+    const tracker = new SubagentTracker();
+    tracker.registerStart({
+      id: "sub_interactive_steer",
+      task: "Running task",
+      logFile: tmpLog,
+    });
+
+    const viewer = new SubagentViewer({
+      id: "sub_interactive_steer",
+      initialMode: "transcript",
+      theme: mockTheme,
+      tui: { requestRender: () => {} },
+      tracker,
+      done: () => {},
+    });
+
+    // 1. Initial state: unfocused placeholder
+    let output = viewer.render(80).join("\n");
+    expect(output).toContain("Press i or Tab to chat with / steer this subagent");
+
+    // 2. Press 'i' to focus input dock
+    viewer.handleInput("i");
+    output = viewer.render(80).join("\n");
+    expect(output).toContain("Chat / Steer Subagent");
+    expect(output).toContain("Enter submit");
+
+    // 3. Type message: "check database queries"
+    for (const ch of "check database queries") {
+      viewer.handleInput(ch);
+    }
+    output = viewer.render(80).join("\n");
+    expect(output).toContain("check database queries");
+
+    // 4. Press Enter to submit steering message
+    viewer.handleInput("\r");
+    expect(written).toContain('"type":"steer"');
+    expect(written).toContain('"message":"check database queries"');
+
+    // 5. Notice shown and returned to unfocused
+    output = viewer.render(80).join("\n");
+    expect(output).toContain("Steered running subagent");
+
+    stopAllSubagents();
+  });
+
+  it("handles backspace, ctrl+u, and escape inside input mode", () => {
+    const tracker = new SubagentTracker();
+    tracker.registerStart({
+      id: "sub_input_editing",
+      task: "Editing test",
+      logFile: tmpLog,
+    });
+
+    const viewer = new SubagentViewer({
+      id: "sub_input_editing",
+      initialMode: "transcript",
+      theme: mockTheme,
+      tui: { requestRender: () => {} },
+      tracker,
+      done: () => {},
+    });
+
+    // Focus input mode
+    viewer.handleInput("i");
+
+    // Type "hello"
+    for (const ch of "hello") viewer.handleInput(ch);
+    let output = viewer.render(80).join("\n");
+    expect(output).toContain("hello");
+
+    // Backspace: deletes 'o'
+    viewer.handleInput("\x7f");
+    output = viewer.render(80).join("\n");
+    expect(output).toContain("hell");
+    expect(output).not.toContain("hello");
+
+    // Ctrl+U clears line
+    viewer.handleInput("\x15");
+    output = viewer.render(80).join("\n");
+    expect(output).not.toContain("hell");
+
+    // Type "cancel me"
+    for (const ch of "cancel me") viewer.handleInput(ch);
+    expect(viewer.render(80).join("\n")).toContain("cancel me");
+
+    // Escape exits input mode without submitting
+    viewer.handleInput("\x1b");
+    output = viewer.render(80).join("\n");
+    expect(output).toContain("Press i or Tab to chat with / steer this subagent");
+    expect(output).not.toContain("cancel me");
+  });
 });

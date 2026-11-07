@@ -5,13 +5,43 @@ import {
   visibleWidth,
   wrapTextWithAnsi,
   stripTerminalSequences,
+  Markdown,
+  Box,
+  Text,
+  Container,
+  Spacer,
 } from "@earendil-works/pi-tui";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import {
+  getMarkdownTheme,
+  createBashToolDefinition,
+  createReadToolDefinition,
+  createEditToolDefinition,
+  createWriteToolDefinition,
+  createGrepToolDefinition,
+  createFindToolDefinition,
+  createLsToolDefinition,
+  renderDiff,
+  highlightCode,
+  getLanguageFromPath,
+  initTheme,
+} from "@earendil-works/pi-coding-agent";
 import { formatTranscriptLines } from "./transcript-formatter.js";
 import { type SubagentTracker, type TrackedSubagent, checkSubagentCompletionOnDisk } from "./tracker.js";
-import { getSubagentDir, getSubagentSessionsDir, activeSubagentProcesses } from "./runner.js";
+import {
+  getSubagentDir,
+  getSubagentSessionsDir,
+  activeSubagentProcesses,
+  activeSubagentHandles,
+  steerSubagent,
+  executeSubagent,
+} from "./runner.js";
+
+try {
+  initTheme?.();
+} catch {}
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -122,6 +152,15 @@ export class SubagentViewer implements Component {
   private timer: ReturnType<typeof setInterval> | null = null;
   private isDisposed = false;
 
+  // Interactive steer / chat & toggles
+  private isInputFocused = false;
+  private inputText = "";
+  private statusNotice?: string;
+  private noticeTimer?: ReturnType<typeof setTimeout>;
+  private toolOutputExpanded = false;
+  private hideThinkingBlock = false;
+  private nativeToolDefs = new Map<string, any>();
+
   constructor(opts: SubagentViewerOptions) {
     this.theme = opts.theme;
     this.tui = opts.tui;
@@ -214,19 +253,95 @@ export class SubagentViewer implements Component {
     }
   }
 
+  private setStatusNotice(notice: string) {
+    this.statusNotice = notice;
+    if (this.noticeTimer) {
+      clearTimeout(this.noticeTimer);
+    }
+    this.noticeTimer = setTimeout(() => {
+      this.statusNotice = undefined;
+      this.tui?.requestRender?.();
+    }, 3000);
+  }
+
+  private getNativeToolDefinition(name: string): any {
+    if (this.nativeToolDefs.has(name)) return this.nativeToolDefs.get(name);
+    try {
+      const cwd = process.cwd();
+      let def: any;
+      if (name === "bash" || name === "$") def = typeof createBashToolDefinition === "function" ? createBashToolDefinition(cwd) : undefined;
+      else if (name === "read") def = typeof createReadToolDefinition === "function" ? createReadToolDefinition(cwd) : undefined;
+      else if (name === "edit") def = typeof createEditToolDefinition === "function" ? createEditToolDefinition(cwd) : undefined;
+      else if (name === "write") def = typeof createWriteToolDefinition === "function" ? createWriteToolDefinition(cwd) : undefined;
+      else if (name === "grep") def = typeof createGrepToolDefinition === "function" ? createGrepToolDefinition(cwd) : undefined;
+      else if (name === "find") def = typeof createFindToolDefinition === "function" ? createFindToolDefinition(cwd) : undefined;
+      else if (name === "ls") def = typeof createLsToolDefinition === "function" ? createLsToolDefinition(cwd) : undefined;
+      if (def) {
+        this.nativeToolDefs.set(name, def);
+        return def;
+      }
+    } catch {}
+    return undefined;
+  }
+
   private reloadChat() {
     this.cachedChatLines = undefined;
     this.cachedWidth = undefined;
 
+    let entries: any[] = [];
     const jsonlPath = this.findSessionJsonl();
     if (jsonlPath && fs.existsSync(jsonlPath)) {
       try {
         const fileContent = fs.readFileSync(jsonlPath, "utf-8");
         const lines = fileContent.split("\n").filter(Boolean);
-        this.parsedEntries = lines.map((l) => JSON.parse(l));
-        this.rawLogContent = null;
-        return;
+        entries = lines.map((l) => JSON.parse(l));
       } catch {}
+    }
+
+    // Merge live in-flight streaming snapshot from activeSubagentHandles if running
+    const handle = activeSubagentHandles.get(this.activeId);
+    if (handle) {
+      const snapshot = handle.parser.getLiveSnapshot();
+      for (const t of snapshot.activeTools) {
+        const existingCall = entries.find(
+          (e) =>
+            e.type === "message" &&
+            e.message?.role === "assistant" &&
+            Array.isArray(e.message?.content) &&
+            e.message.content.some((c: any) => c.type === "toolCall" && c.id === t.toolCallId)
+        );
+        if (!existingCall) {
+          entries.push({
+            type: "message",
+            message: {
+              role: "assistant",
+              content: [
+                {
+                  type: "toolCall",
+                  id: t.toolCallId,
+                  name: t.toolName,
+                  arguments: t.args,
+                  isRunning: true,
+                },
+              ],
+            },
+          });
+        }
+      }
+
+      if (snapshot.streamingMessage && snapshot.streamingMessage.content?.length > 0) {
+        entries.push({
+          type: "message",
+          message: snapshot.streamingMessage,
+          isStreaming: true,
+        });
+      }
+    }
+
+    if (entries.length > 0) {
+      this.parsedEntries = entries;
+      this.rawLogContent = null;
+      return;
     }
 
     // Fallback to raw log file or plain text
@@ -314,8 +429,18 @@ export class SubagentViewer implements Component {
         let text = m.content?.[0]?.text || "";
         text = text.replace(/^You are a subagent spawned by another session\.\s*/i, "").trim();
 
+        let badge: string | undefined;
+        let cleanText = text;
+        if (text.startsWith("[user steer]")) {
+          cleanText = text.slice("[user steer]".length).trim();
+          badge = "steer";
+        } else if (text.startsWith("[user follow_up]")) {
+          cleanText = text.slice("[user follow_up]".length).trim();
+          badge = "follow_up";
+        }
+
         // Render User Message in Pi's exact shaded userMessageBg box
-        const userBox = this.renderUserMessageBox(text, width);
+        const userBox = this.renderUserMessageBox(cleanText, width, badge);
         for (const line of userBox) {
           formatted.push(line);
         }
@@ -332,53 +457,13 @@ export class SubagentViewer implements Component {
 
           // Tool call execution box
           if (part.type === "toolCall") {
-            const isBash = part.name === "bash" || part.name === "$";
             const res = toolResults.get(part.id);
+            const isRunningTool = Boolean(part.isRunning || (!res && status === "running"));
 
             formatted.push("");
-            if (isBash) {
-              const command = part.arguments?.command || "";
-              const bashBox = this.renderBashToolBox(
-                command,
-                res?.text || "",
-                res?.durationMs,
-                res?.isError ?? false,
-                width
-              );
-              for (const line of bashBox) {
-                formatted.push(line);
-              }
-            } else {
-              const argsSummary = Object.entries(part.arguments || {})
-                .map(([k, v]) => `${k}=${typeof v === "object" ? JSON.stringify(v) : v}`)
-                .join(" ");
-
-              let callHeader = `${part.name} ${argsSummary}`.trim();
-              if (part.name === "subagent") {
-                const subDesc = part.arguments?.description || part.arguments?.task || "";
-                const subAgent = part.arguments?.agent ? ` [${part.arguments.agent}]` : "";
-                callHeader = `Subagent${subAgent} "${subDesc}"`;
-                if (part.arguments?.isolated === false) callHeader += " [shared]";
-                if (part.arguments?.background === false) callHeader += " · blocking";
-                else callHeader += " · background";
-              }
-
-              const resultTitle =
-                part.name === "subagent"
-                  ? `Subagent completed [${part.id || ""}]`
-                  : `${part.name} completed`;
-
-              const toolBox = this.renderGenericToolBox(
-                callHeader,
-                resultTitle,
-                res?.text || "",
-                res?.isError ?? false,
-                false,
-                width
-              );
-              for (const line of toolBox) {
-                formatted.push(line);
-              }
+            const toolBox = this.renderToolCallAndResult(part, res, width, isRunningTool);
+            for (const line of toolBox) {
+              formatted.push(line);
             }
             formatted.push("");
           }
@@ -435,12 +520,64 @@ export class SubagentViewer implements Component {
     return result;
   }
 
+  private renderToolCallAndResult(
+    part: any,
+    res: { text: string; durationMs?: number; isError: boolean } | undefined,
+    width: number,
+    isRunning = false
+  ): string[] {
+    const isError = res?.isError ?? false;
+    const isBash = part.name === "bash" || part.name === "$";
+
+    if (isBash) {
+      const command = part.arguments?.command || "";
+      return this.renderBashToolBox(
+        command,
+        res?.text || "",
+        res?.durationMs,
+        isError,
+        width,
+        isRunning
+      );
+    }
+
+    const argsSummary = Object.entries(part.arguments || {})
+      .map(([k, v]) => `${k}=${typeof v === "object" ? JSON.stringify(v) : v}`)
+      .join(" ");
+
+    let callHeader = `${part.name} ${argsSummary}`.trim();
+    if (part.name === "subagent") {
+      const subDesc = part.arguments?.description || part.arguments?.task || "";
+      const subAgent = part.arguments?.agent ? ` [${part.arguments.agent}]` : "";
+      callHeader = `Subagent${subAgent} "${subDesc}"`;
+      if (part.arguments?.isolated === false) callHeader += " [shared]";
+      if (part.arguments?.background === false) callHeader += " · blocking";
+      else callHeader += " · background";
+    }
+
+    const resultTitle = isRunning
+      ? `${part.name} in progress...`
+      : part.name === "subagent"
+        ? `Subagent completed [${part.id || ""}]`
+        : `${part.name} completed`;
+
+    return this.renderGenericToolBox(
+      callHeader,
+      resultTitle,
+      res?.text || "",
+      isError,
+      isRunning,
+      width
+    );
+  }
+
   private renderBashToolBox(
     command: string,
     output: string,
     durationMs: number | undefined,
     isError: boolean,
-    width: number
+    width: number,
+    isRunning = false
   ): string[] {
     const innerWidth = Math.max(10, width - 4);
     const boxContent: string[] = [];
@@ -456,15 +593,19 @@ export class SubagentViewer implements Component {
     if (cleanOutput) {
       boxContent.push("");
       const outLines = cleanOutput.split("\n");
-      const previewLines = outLines.slice(0, 15);
+      const previewLimit = this.toolOutputExpanded ? outLines.length : 15;
+      const previewLines = outLines.slice(0, previewLimit);
       for (const line of previewLines) {
         for (const w of wrapTextWithAnsi(line, innerWidth)) {
           boxContent.push(this.theme.fg("toolOutput", w));
         }
       }
-      if (outLines.length > 15) {
-        boxContent.push(this.theme.fg("dim", `... (${outLines.length - 15} more lines)`));
+      if (!this.toolOutputExpanded && outLines.length > 15) {
+        boxContent.push(this.theme.fg("dim", `... (${outLines.length - 15} more lines · ctrl+o to expand)`));
       }
+    } else if (isRunning) {
+      boxContent.push("");
+      boxContent.push(this.theme.fg("dim", "Running command..."));
     }
 
     // 3. Duration footer: Took 0.2s
@@ -473,7 +614,7 @@ export class SubagentViewer implements Component {
       boxContent.push(this.theme.fg("dim", `Took ${formatDuration(durationMs)}`));
     }
 
-    const bgToken = isError ? "toolErrorBg" : "toolSuccessBg";
+    const bgToken = isError ? "toolErrorBg" : isRunning ? "toolPendingBg" : "toolSuccessBg";
     return this.renderShadedBox(boxContent, width, bgToken, true);
   }
 
@@ -494,14 +635,19 @@ export class SubagentViewer implements Component {
     }
 
     // 2. Result header line: green ● (or error ▲), cyan title, dim extra
-    const icon = isError ? this.theme.fg("error", "▲") : this.theme.fg("success", "●");
+    const icon = isRunning
+      ? this.theme.fg("accent", SPINNER_FRAMES[this.frameIndex])
+      : isError
+        ? this.theme.fg("error", "▲")
+        : this.theme.fg("success", "●");
     boxContent.push(`${icon} ${this.theme.bold(this.theme.fg("toolTitle", resultHeader))}`);
 
     // 3. Result body with vertical gutter: `  │ <line>`
     const cleanBody = resultBody.trim();
     if (cleanBody) {
       const rawLines = cleanBody.split("\n");
-      const previewLines = rawLines.slice(0, 8);
+      const previewLimit = this.toolOutputExpanded ? rawLines.length : 8;
+      const previewLines = rawLines.slice(0, previewLimit);
       const gutter = this.theme.fg("dim", "  │ ");
       const availWidth = Math.max(10, innerWidth - 4);
 
@@ -512,9 +658,11 @@ export class SubagentViewer implements Component {
         }
       }
 
-      if (rawLines.length > 8) {
-        boxContent.push(this.theme.fg("dim", `  (click or ctrl+e to view full transcript)`));
+      if (!this.toolOutputExpanded && rawLines.length > 8) {
+        boxContent.push(this.theme.fg("dim", `  (${rawLines.length - 8} more lines · ctrl+o to expand)`));
       }
+    } else if (isRunning) {
+      boxContent.push(this.theme.fg("dim", "  │ executing..."));
     }
 
     const bgToken = isError ? "toolErrorBg" : isRunning ? "toolPendingBg" : "toolSuccessBg";
@@ -522,16 +670,51 @@ export class SubagentViewer implements Component {
   }
 
   private renderThinkingBlock(text: string, width: number): string[] {
+    if (this.hideThinkingBlock) {
+      return [this.theme.fg("dim", "  Thinking... (press alt+t to expand)")];
+    }
+    try {
+      if (typeof Markdown === "function" && typeof getMarkdownTheme === "function") {
+        const mdTheme = getMarkdownTheme();
+        const md = new Markdown(text, 0, 0, mdTheme);
+        const lines = md.render(Math.max(10, width - 4));
+        return lines.map((l) => `\x1b[3m${this.theme.fg("thinkingText", l)}\x1b[23m`);
+      }
+    } catch {}
+
     const innerWidth = Math.max(10, width - 4);
     const wrapped = wrapTextWithAnsi(text, innerWidth);
     return wrapped.map((w) => `\x1b[3m${this.theme.fg("dim", w)}\x1b[23m`);
   }
 
-  private renderUserMessageBox(text: string, width: number): string[] {
+  private renderUserMessageBox(text: string, width: number, badge?: string): string[] {
     const innerWidth = Math.max(10, width - 4);
-    const wrapped = wrapTextWithAnsi(text, innerWidth);
-
     const lines: string[] = [];
+    if (badge) {
+      lines.push(this.theme.bold ? this.theme.bold(this.theme.fg("accent", `[user ${badge}]`)) : `[user ${badge}]`);
+    }
+
+    try {
+      if (typeof Markdown === "function" && typeof Box === "function" && typeof getMarkdownTheme === "function") {
+        const mdTheme = getMarkdownTheme();
+        const md = new Markdown(text, 0, 0, mdTheme);
+        const bgFn = (line: string) => {
+          try {
+            return this.theme.bg ? this.theme.bg("userMessageBg", line) : line;
+          } catch {
+            return line;
+          }
+        };
+        const box = new Box(1, 1, bgFn);
+        if (badge) {
+          box.addChild(new Text(this.theme.bold ? this.theme.bold(this.theme.fg("accent", `[user ${badge}]`)) : `[user ${badge}]`, 0, 0));
+        }
+        box.addChild(md);
+        return box.render(width);
+      }
+    } catch {}
+
+    const wrapped = wrapTextWithAnsi(text, innerWidth);
     for (const line of wrapped) {
       lines.push(this.theme.fg("userMessageText", line));
     }
@@ -540,6 +723,18 @@ export class SubagentViewer implements Component {
   }
 
   private renderAssistantMarkdown(text: string, width: number): string[] {
+    try {
+      if (typeof Markdown === "function" && typeof getMarkdownTheme === "function") {
+        const mdTheme = getMarkdownTheme();
+        const md = new Markdown(text, 0, 0, mdTheme);
+        return md.render(Math.max(10, width - 2));
+      }
+    } catch {}
+
+    return this.fallbackAssistantMarkdown(text, width);
+  }
+
+  private fallbackAssistantMarkdown(text: string, width: number): string[] {
     const result: string[] = [];
     const rawLines = text.split("\n");
     const maxTextWidth = Math.max(10, width - 2);
@@ -684,6 +879,10 @@ export class SubagentViewer implements Component {
     if (this.isDisposed) return;
     this.isDisposed = true;
     this.stopTimer();
+    if (this.noticeTimer) {
+      clearTimeout(this.noticeTimer);
+      this.noticeTimer = undefined;
+    }
   }
 
   dispose() {
@@ -790,6 +989,99 @@ export class SubagentViewer implements Component {
   }
 
   private handleTranscriptInput(data: string): void {
+    if (this.isInputFocused) {
+      if (matchesKey(data, "escape") || matchesKey(data, "tab")) {
+        this.isInputFocused = false;
+        this.tui.requestRender();
+        return;
+      }
+
+      if (matchesKey(data, "ctrl+u")) {
+        this.inputText = "";
+        this.tui.requestRender();
+        return;
+      }
+
+      if (matchesKey(data, "backspace") || data === "\x7f" || data === "\b") {
+        this.inputText = this.inputText.slice(0, -1);
+        this.tui.requestRender();
+        return;
+      }
+
+      if (matchesKey(data, "return") || matchesKey(data, "enter")) {
+        const prompt = this.inputText.trim();
+        if (!prompt) {
+          this.isInputFocused = false;
+          this.tui.requestRender();
+          return;
+        }
+
+        const sub = this.getSubagentInfo();
+        const handle = activeSubagentHandles.get(this.activeId);
+        const isRunning = Boolean(
+          (sub?.status === "running" || handle) &&
+          handle?.child &&
+          !handle.child.killed &&
+          handle.child.exitCode === null
+        );
+
+        if (isRunning) {
+          steerSubagent(this.activeId, prompt, "steer");
+          this.setStatusNotice("Steered running subagent");
+        } else {
+          void executeSubagent({
+            sessionID: this.activeId,
+            task: prompt,
+            cwd: (sub as any)?.cwd ?? process.cwd(),
+            agent: sub?.agent,
+            model: sub?.model,
+            reasoning: sub?.reasoning,
+            isolated: sub?.isolated,
+            background: true,
+          }).catch(() => {});
+          this.setStatusNotice("Continued subagent");
+          this.startTimerIfNeeded();
+          this.autoTail = true;
+        }
+
+        this.inputText = "";
+        this.isInputFocused = false;
+        this.reloadChat();
+        this.tui.requestRender();
+        return;
+      }
+
+      // Append printable character
+      if (!data.startsWith("\x1b") && !data.startsWith("\x00") && data.length >= 1 && data >= " ") {
+        this.inputText += data;
+        this.tui.requestRender();
+      }
+      return;
+    }
+
+    // Input mode entry keys: i, s, or tab focuses bottom input dock
+    if (data === "i" || data === "I" || data === "s" || data === "S" || matchesKey(data, "tab")) {
+      this.isInputFocused = true;
+      this.tui.requestRender();
+      return;
+    }
+
+    // Expand / collapse all tool output
+    if (matchesKey(data, "ctrl+o")) {
+      this.toolOutputExpanded = !this.toolOutputExpanded;
+      this.cachedChatLines = undefined;
+      this.tui.requestRender();
+      return;
+    }
+
+    // Toggle thinking block visibility
+    if (matchesKey(data, "alt+t") || matchesKey(data, "ctrl+t")) {
+      this.hideThinkingBlock = !this.hideThinkingBlock;
+      this.cachedChatLines = undefined;
+      this.tui.requestRender();
+      return;
+    }
+
     if (matchesKey(data, "escape") || data === "q" || data === "Q" || matchesKey(data, "ctrl+c")) {
       if (this.canGoBackToList) {
         this.mode = "list";
@@ -1041,33 +1333,50 @@ export class SubagentViewer implements Component {
     // 2. Pi's Exact Dock (Divider -> Input Margin -> Divider -> Footer)
     const isRunning = status === "running";
     const spinner = SPINNER_FRAMES[this.frameIndex];
-
-    // Divider above input margin (magenta/accent when working, dim otherwise)
-    if (isRunning) {
-      const workingHeader = `── ${spinner} Working `;
-      const fillLen = Math.max(0, width - visibleWidth(workingHeader));
-      lines.push(this.theme.fg("thinkingHigh", `${workingHeader}${"─".repeat(fillLen)}`));
-    } else {
-      lines.push(this.theme.fg("dim", "─".repeat(Math.max(1, width))));
-    }
-
-    // Input bar margin (maintaining the exact margin from Pi's input bar)
     const backHint = this.canGoBackToList ? "Back to list" : "Close";
-    const marginHint = this.theme.fg("dim", `  [read-only] Esc/q: ${backHint}`);
-    lines.push(marginHint);
 
-    // Divider below input margin
-    lines.push(this.theme.fg("dim", "─".repeat(Math.max(1, width))));
+    if (this.isInputFocused) {
+      const chatHeader = "── Chat / Steer Subagent ";
+      const fillLen = Math.max(0, width - visibleWidth(chatHeader));
+      lines.push(this.theme.fg("accent", `${chatHeader}${"─".repeat(fillLen)}`));
 
-    // Footer Line 1: cwd • subagent description/title (Updated to subagent's!)
-    const cwd = process.cwd();
-    const home = os.homedir();
-    const shortenedCwd = cwd.startsWith(home) ? `~${cwd.slice(home.length)}` : cwd;
-    const pwdLine = truncateToWidth(
-      `${this.theme.fg("dim", shortenedCwd)} ${this.theme.fg("dim", "•")} ${this.theme.fg("dim", taskTitle)}`,
-      width
-    );
-    lines.push(pwdLine);
+      const inputDisplay = `  ${this.theme.fg("accent", "›")} ${this.inputText}${this.theme.fg("accent", "█")}`;
+      lines.push(truncateToWidth(inputDisplay, width));
+
+      lines.push(this.theme.fg("dim", "─".repeat(Math.max(1, width))));
+
+      const hints = "  Enter submit · Esc/Tab cancel · Ctrl+U clear";
+      lines.push(this.theme.fg("muted", truncateToWidth(hints, width)));
+    } else {
+      if (isRunning) {
+        const workingHeader = `── ${spinner} Working `;
+        const fillLen = Math.max(0, width - visibleWidth(workingHeader));
+        lines.push(this.theme.fg("thinkingHigh", `${workingHeader}${"─".repeat(fillLen)}`));
+      } else {
+        lines.push(this.theme.fg("dim", "─".repeat(Math.max(1, width))));
+      }
+
+      if (this.statusNotice) {
+        const noticeLine = `  ${this.theme.fg("accent", `[${this.statusNotice}]`)} ${this.theme.fg("dim", `Press i or Tab to chat with / steer this subagent · ctrl+o expand tools · alt+t thinking · Esc/q: ${backHint}`)}`;
+        lines.push(truncateToWidth(noticeLine, width));
+      } else {
+        const prefix = status !== "running" ? "[read-only] " : "";
+        const promptPlaceholder = `  › ${prefix}Esc/q: ${backHint} · Press i or Tab to chat with / steer this subagent · ctrl+o expand tools · alt+t thinking`;
+        lines.push(this.theme.fg("dim", truncateToWidth(promptPlaceholder, width)));
+      }
+
+      lines.push(this.theme.fg("dim", "─".repeat(Math.max(1, width))));
+
+      // Footer Line 1: cwd • subagent description/title (Updated to subagent's!)
+      const cwd = process.cwd();
+      const home = os.homedir();
+      const shortenedCwd = cwd.startsWith(home) ? `~${cwd.slice(home.length)}` : cwd;
+      const pwdLine = truncateToWidth(
+        `${this.theme.fg("dim", shortenedCwd)} ${this.theme.fg("dim", "•")} ${this.theme.fg("dim", taskTitle)}`,
+        width
+      );
+      lines.push(pwdLine);
+    }
 
     // Footer Line 2: Stats on left, (provider) model • reasoning on right (Pi style)
     const stats = sub?.stats;
