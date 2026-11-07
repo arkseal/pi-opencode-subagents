@@ -167,7 +167,7 @@ describe("Subagent Runner Configuration", () => {
 describe("buildPiArgs", () => {
   it("builds default CLI args for standard subagent task", () => {
     const args = buildPiArgs({ task: "Write tests for auth module" });
-    expect(args).toEqual(["--mode", "json", "-p", "--no-session", "-a", "Write tests for auth module"]);
+    expect(args).toEqual(["--mode", "json", "-p", "--no-session", "--", "Write tests for auth module"]);
   });
 
   it("appends --model when model is specified", () => {
@@ -182,7 +182,7 @@ describe("buildPiArgs", () => {
       "--no-session",
       "--model",
       "anthropic/claude-3-7-sonnet",
-      "-a",
+      "--",
       "Refactor database query",
     ]);
   });
@@ -199,7 +199,7 @@ describe("buildPiArgs", () => {
       "--no-session",
       "--model",
       "claude-sonnet:high",
-      "-a",
+      "--",
       "Solve competitive programming problem",
     ]);
   });
@@ -216,7 +216,7 @@ describe("buildPiArgs", () => {
       "--no-session",
       "--thinking",
       "high",
-      "-a",
+      "--",
       "Analyze race condition",
     ]);
   });
@@ -233,7 +233,7 @@ describe("buildPiArgs", () => {
       "--no-session",
       "--thinking",
       "low",
-      "-a",
+      "--",
       "Analyze race condition",
     ]);
   });
@@ -253,8 +253,16 @@ describe("buildPiArgs", () => {
       "gemini-3.8-flash",
       "--thinking",
       "max",
-      "-a",
+      "--",
       "Complex architecture design",
     ]);
+  });
+
+  it("safely passes prompts starting with - or @ after -- delimiter", () => {
+    const dashArgs = buildPiArgs({ task: "--help and -v flags should not be parsed as CLI flags" });
+    expect(dashArgs.slice(-2)).toEqual(["--", "--help and -v flags should not be parsed as CLI flags"]);
+
+    const atArgs = buildPiArgs({ task: "@docs/api.md review" });
+    expect(atArgs.slice(-2)).toEqual(["--", "@docs/api.md review"]);
   });
 });

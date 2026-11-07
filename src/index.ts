@@ -9,6 +9,12 @@ import {
   shutdownSubagent,
   shutdownAllSubagents,
   buildPiArgs,
+  parseModelSpec,
+  resolveAndValidateModel,
+  getPiInvocation,
+  writePromptToTempFile,
+  ensureSubagentSessionFile,
+  toPiUsage,
   type SubagentModelOption,
 } from "./runner.js";
 import {
@@ -45,6 +51,12 @@ export {
   shutdownSubagent,
   shutdownAllSubagents,
   buildPiArgs,
+  parseModelSpec,
+  resolveAndValidateModel,
+  getPiInvocation,
+  writePromptToTempFile,
+  ensureSubagentSessionFile,
+  toPiUsage,
   type SubagentModelOption,
 } from "./runner.js";
 export { createWorktree, cleanupWorktree } from "./worktree.js";
@@ -374,6 +386,13 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
         onUpdate,
         uiContext: ctx,
         onBackgroundComplete: (bgResult) => {
+          const currentLine =
+            bgResult.status === "completed"
+              ? "Done"
+              : bgResult.status === "aborted"
+                ? "Aborted"
+                : (bgResult.errorMessage || "Failed");
+
           // Deliver completion record to session JSONL
           try {
             const record = {
@@ -390,7 +409,7 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
               status: bgResult.status,
               isolated: (bgResult as any).isolated ?? params.isolated ?? true,
               logFile: (bgResult as any).logFile,
-              currentLine: "Done",
+              currentLine,
               stats: bgResult.stats,
             };
             if (typeof (pi as any).appendEntry === "function") {
@@ -416,6 +435,8 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
                 logFilePath: (bgResult as any).logFile,
               });
 
+              const triggerTurn = bgResult.status !== "aborted";
+
               // Deliver visually compacted response using sendMessage if supported, else sendUserMessage
               if (typeof (pi as any).sendMessage === "function") {
                 (pi as any).sendMessage(
@@ -439,18 +460,17 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
                     },
                   },
                   {
-                    triggerTurn: true,
+                    triggerTurn,
                     deliverAs: isAgentActive ? "steer" : undefined,
                   }
                 );
               } else if (typeof (pi as any).sendUserMessage === "function") {
-                if (isAgentActive) {
-                  // If main chat is working, queue with deliverAs: "steer"
-                  // Pi prioritizes steering messages ahead of queued user follow-ups!
-                  (pi as any).sendUserMessage(envelope, { deliverAs: "steer" });
-                } else {
-                  // If main chat is idle, restart main chat so it responds immediately
-                  (pi as any).sendUserMessage(envelope);
+                if (triggerTurn) {
+                  if (isAgentActive) {
+                    (pi as any).sendUserMessage(envelope, { deliverAs: "steer" });
+                  } else {
+                    (pi as any).sendUserMessage(envelope);
+                  }
                 }
               }
             } catch (err) {
@@ -474,6 +494,13 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
       // Persist completed subagent metadata to session JSONL so it survives session exit and rejoin
       if (!isBackground) {
         try {
+          const currentLine =
+            result.details.status === "completed"
+              ? "Done"
+              : result.details.status === "aborted"
+                ? "Aborted"
+                : "Failed";
+
           const record = {
             id: result.details.id,
             sessionID: result.details.sessionID,
@@ -489,7 +516,7 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
             isolated: result.details.isolated,
             logFile: result.details.logFile,
             exitCode: result.details.exitCode,
-            currentLine: "Done",
+            currentLine,
             stats: result.details.stats,
           };
           if (typeof (pi as any).appendEntry === "function") {
@@ -501,11 +528,18 @@ export default function opencodeSubagentsExtension(pi: ExtensionAPI) {
       }
 
       const isFailed = result.details.status === "failed" || result.details.status === "aborted";
-      return {
+      const toolResult: any = {
         content: [{ type: "text", text: result.output }],
         details: result.details,
         isError: isFailed,
       };
+      if (!isBackground) {
+        const usage = toPiUsage(result.details?.stats);
+        if (usage) {
+          toolResult.usage = usage;
+        }
+      }
+      return toolResult;
     },
   });
 }

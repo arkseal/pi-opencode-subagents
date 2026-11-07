@@ -2,6 +2,18 @@ import * as fs from "node:fs/promises";
 import * as fsSync from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import { getAgentDir, CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
+
+function safeGetAgentDir(): string {
+  try {
+    if (typeof getAgentDir === "function") {
+      return getAgentDir();
+    }
+  } catch {}
+  return process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), ".pi", "agent");
+}
+
+const EFFECTIVE_CONFIG_DIR_NAME = typeof CONFIG_DIR_NAME === "string" ? CONFIG_DIR_NAME : ".pi";
 
 export interface AgentProfile {
   id: string;
@@ -152,9 +164,9 @@ export async function discoverAgents(cwd: string): Promise<AgentProfile[]> {
 
   const candidateDirs = [
     path.join(os.homedir(), ".config", "opencode", "agents"),
-    path.join(os.homedir(), ".pi", "agent", "agents"),
+    path.join(safeGetAgentDir(), "agents"),
     path.join(cwd, ".opencode", "agents"),
-    path.join(cwd, ".pi", "agents"),
+    path.join(cwd, EFFECTIVE_CONFIG_DIR_NAME, "agents"),
   ];
 
   for (const dir of candidateDirs) {

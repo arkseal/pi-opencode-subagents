@@ -4,12 +4,35 @@ import * as fsSync from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { randomUUID } from "node:crypto";
+import type { Usage } from "@earendil-works/pi-ai";
+import {
+  getAgentDir,
+  CONFIG_DIR_NAME,
+  withFileMutationQueue,
+} from "@earendil-works/pi-coding-agent";
+import { stripTerminalSequences } from "@earendil-works/pi-tui";
 import { createWorktree, cleanupWorktree, type WorktreeInfo } from "./worktree.js";
 import { formatSubagentEnvelope } from "./envelope.js";
 import { checkSubagentDepth } from "./depth-guard.js";
 import { globalSubagentTracker } from "./tracker.js";
-import { SubagentEventParser } from "./event-parser.js";
+import { SubagentEventParser, type SubagentStats } from "./event-parser.js";
 import { resolveAgent, type AgentProfile } from "./agents.js";
+
+function safeGetAgentDir(): string {
+  try {
+    if (typeof getAgentDir === "function") {
+      return getAgentDir();
+    }
+  } catch {}
+  return process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), ".pi", "agent");
+}
+
+async function safeWithFileMutationQueue<T>(filePath: string, fn: () => Promise<T>): Promise<T> {
+  if (typeof withFileMutationQueue === "function") {
+    return withFileMutationQueue(filePath, fn);
+  }
+  return fn();
+}
 
 export interface ActiveSubagentHandle {
   id: string;
@@ -23,6 +46,7 @@ export interface ActiveSubagentHandle {
   signal?: AbortSignal;
   isAborted?: boolean;
   suppressCallbacks?: boolean;
+  cleanupTempPrompt?: () => void;
 }
 
 export const activeSubagentHandles = new Map<string, ActiveSubagentHandle>();
@@ -98,6 +122,10 @@ export function stopSubagent(id: string): boolean {
     if (handle.signal && handle.abortHandler) {
       handle.signal.removeEventListener("abort", handle.abortHandler);
     }
+    if (handle.cleanupTempPrompt) {
+      handle.cleanupTempPrompt();
+      handle.cleanupTempPrompt = undefined;
+    }
     if (handle.logFd !== undefined) {
       try {
         fsSync.closeSync(handle.logFd);
@@ -130,6 +158,10 @@ export async function shutdownSubagent(id: string, timeoutMs = 2500): Promise<bo
     handle.suppressCallbacks = true;
     if (handle.signal && handle.abortHandler) {
       handle.signal.removeEventListener("abort", handle.abortHandler);
+    }
+    if (handle.cleanupTempPrompt) {
+      handle.cleanupTempPrompt();
+      handle.cleanupTempPrompt = undefined;
     }
     if (handle.logFd !== undefined) {
       try {
@@ -188,7 +220,7 @@ export async function shutdownAllSubagents(timeoutMs = 2500): Promise<number> {
 }
 
 export function getSubagentDir(): string {
-  const homePiDir = path.join(os.homedir(), ".pi", "agent", "subagents");
+  const homePiDir = path.join(safeGetAgentDir(), "subagents");
   try {
     if (!fsSync.existsSync(homePiDir)) {
       fsSync.mkdirSync(homePiDir, { recursive: true });
@@ -214,6 +246,132 @@ export function getSubagentSessionsDir(): string {
   return sessionsDir;
 }
 
+export function getPiInvocation(args: string[]): { command: string; args: string[] } {
+  if (process.env.PI_BIN_PATH) {
+    return { command: process.env.PI_BIN_PATH, args };
+  }
+  const currentScript = process.argv[1];
+  const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
+  if (currentScript && !isBunVirtualScript && fsSync.existsSync(currentScript)) {
+    return { command: process.execPath, args: [currentScript, ...args] };
+  }
+
+  const execName = path.basename(process.execPath).toLowerCase();
+  const isGenericRuntime = /^(node|bun)(\.exe)?$/.test(execName);
+  if (!isGenericRuntime) {
+    return { command: process.execPath, args };
+  }
+
+  return { command: "pi", args };
+}
+
+export async function writePromptToTempFile(
+  agentName: string,
+  prompt: string
+): Promise<{ dir: string; filePath: string }> {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-subagent-prompt-"));
+  const safeName = agentName.replace(/[^\w.-]+/g, "_");
+  const filePath = path.join(tmpDir, `prompt-${safeName}.md`);
+  await safeWithFileMutationQueue(filePath, async () => {
+    await fs.writeFile(filePath, prompt, { encoding: "utf-8", mode: 0o600 });
+  });
+  return { dir: tmpDir, filePath };
+}
+
+export function ensureSubagentSessionFile(
+  sessionsDir: string,
+  id: string,
+  cwd: string
+): { sessionFile: string; isExisting: boolean } {
+  const sanitizedId = path.basename(id).replace(/[^a-zA-Z0-9_-]/g, "_");
+  if (!sanitizedId || sanitizedId === "." || sanitizedId === "..") {
+    throw new Error(`Invalid subagent session id: "${id}"`);
+  }
+
+  if (!fsSync.existsSync(sessionsDir)) {
+    fsSync.mkdirSync(sessionsDir, { recursive: true });
+  }
+
+  const directFile = path.join(sessionsDir, `${sanitizedId}.jsonl`);
+  let targetFile: string | null = null;
+
+  if (fsSync.existsSync(directFile) && fsSync.statSync(directFile).size > 0) {
+    targetFile = directFile;
+  } else {
+    try {
+      const files = fsSync.readdirSync(sessionsDir);
+      for (const file of files) {
+        if (!file.endsWith(".jsonl")) continue;
+        if (file === `${sanitizedId}.jsonl` || file.endsWith(`_${sanitizedId}.jsonl`)) {
+          const fp = path.join(sessionsDir, file);
+          if (fsSync.statSync(fp).size > 0) {
+            targetFile = fp;
+            break;
+          }
+        }
+      }
+      if (!targetFile) {
+        for (const file of files) {
+          if (!file.endsWith(".jsonl")) continue;
+          const fp = path.join(sessionsDir, file);
+          try {
+            const fd = fsSync.openSync(fp, "r");
+            const buf = Buffer.alloc(1024);
+            const bytesRead = fsSync.readSync(fd, buf, 0, 1024, 0);
+            fsSync.closeSync(fd);
+            if (bytesRead > 0) {
+              const firstLine = buf.toString("utf-8").split("\n")[0];
+              const parsed = JSON.parse(firstLine);
+              if (parsed?.type === "session" && (parsed.id === id || parsed.id === sanitizedId)) {
+                targetFile = fp;
+                break;
+              }
+            }
+          } catch {}
+        }
+      }
+    } catch {}
+  }
+
+  const resolvedCwd = path.resolve(cwd);
+
+  if (targetFile) {
+    const content = fsSync.readFileSync(targetFile, "utf-8");
+    const lines = content.split("\n");
+    const firstLine = lines[0]?.trim();
+    if (firstLine) {
+      try {
+        const header = JSON.parse(firstLine);
+        if (header && header.type === "session") {
+          if (header.cwd !== resolvedCwd) {
+            header.cwd = resolvedCwd;
+            lines[0] = JSON.stringify(header);
+            const tempFile = `${targetFile}.tmp.${randomUUID()}`;
+            fsSync.writeFileSync(tempFile, lines.join("\n"), "utf-8");
+            fsSync.renameSync(tempFile, targetFile);
+          }
+          const nonEmptyLines = lines.filter((l) => l.trim().length > 0);
+          const isExisting = nonEmptyLines.length > 1;
+          return { sessionFile: targetFile, isExisting };
+        }
+      } catch {}
+    }
+  }
+
+  const sessionFile = targetFile || directFile;
+  const header = {
+    type: "session",
+    version: 3,
+    id: sanitizedId,
+    timestamp: new Date().toISOString(),
+    cwd: resolvedCwd,
+  };
+  const tempFile = `${sessionFile}.tmp.${randomUUID()}`;
+  fsSync.writeFileSync(tempFile, `${JSON.stringify(header)}\n`, "utf-8");
+  fsSync.renameSync(tempFile, sessionFile);
+  return { sessionFile, isExisting: false };
+}
+
 export type SubagentModelOption =
   | string
   | {
@@ -222,6 +380,143 @@ export type SubagentModelOption =
       reasoning?: string;
       thinking?: string;
     };
+
+const VALID_THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+
+export function parseModelSpec(
+  rawModel?: SubagentModelOption,
+  rawReasoning?: string,
+  rawThinking?: string
+): { model?: string; thinking?: string } {
+  let modelStr: string | undefined;
+  let modelThinking: string | undefined;
+
+  if (typeof rawModel === "string") {
+    modelStr = rawModel.trim();
+  } else if (typeof rawModel === "object" && rawModel !== null) {
+    modelStr = (rawModel.model || rawModel.name)?.trim();
+    modelThinking = rawModel.reasoning || rawModel.thinking;
+  }
+
+  let thinkingSuffix: string | undefined;
+  if (modelStr) {
+    const lastColon = modelStr.lastIndexOf(":");
+    if (lastColon !== -1) {
+      const suffix = modelStr.slice(lastColon + 1).toLowerCase();
+      if (VALID_THINKING_LEVELS.has(suffix)) {
+        modelStr = modelStr.slice(0, lastColon);
+        thinkingSuffix = suffix;
+      }
+    }
+  }
+
+  const explicitThinking = rawReasoning ?? rawThinking ?? modelThinking;
+  const thinking = explicitThinking ?? thinkingSuffix;
+
+  return {
+    model: modelStr || undefined,
+    thinking: thinking || undefined,
+  };
+}
+
+export function resolveAndValidateModel(
+  model: string | undefined,
+  uiContext?: any
+): string | undefined {
+  if (!model) return undefined;
+  const modelRegistry = uiContext?.modelRegistry;
+  if (!modelRegistry || typeof modelRegistry.getAll !== "function") {
+    return model;
+  }
+
+  const allModels: Array<{ id: string; provider: string }> = modelRegistry.getAll();
+  if (!Array.isArray(allModels) || allModels.length === 0) {
+    return model;
+  }
+
+  const hasSlash = model.includes("/");
+  let qualifiedModel = model;
+
+  if (!hasSlash) {
+    const bareLower = model.toLowerCase();
+    const matching = allModels.filter((m) => m.id.toLowerCase() === bareLower);
+
+    if (matching.length === 1) {
+      const matched = matching[0];
+      if (typeof modelRegistry.hasConfiguredAuth === "function" && !modelRegistry.hasConfiguredAuth(matched)) {
+        throw new Error(`No authentication configured for model "${matched.provider}/${matched.id}".`);
+      }
+      qualifiedModel = `${matched.provider}/${matched.id}`;
+    } else if (matching.length > 1) {
+      let authedMatches = matching;
+      if (typeof modelRegistry.hasConfiguredAuth === "function") {
+        const authed = matching.filter((m) => modelRegistry.hasConfiguredAuth(m));
+        if (authed.length > 0) {
+          authedMatches = authed;
+        }
+      }
+
+      if (authedMatches.length === 1) {
+        const matched = authedMatches[0];
+        qualifiedModel = `${matched.provider}/${matched.id}`;
+      } else if (authedMatches.length > 1) {
+        const parentProvider = uiContext?.model?.provider;
+        const parentMatch = parentProvider
+          ? authedMatches.find((m) => m.provider.toLowerCase() === parentProvider.toLowerCase())
+          : undefined;
+
+        if (parentMatch) {
+          qualifiedModel = `${uiContext.model.provider}/${parentMatch.id}`;
+        } else {
+          const candidates = authedMatches.map((m) => `${m.provider}/${m.id}`).join(", ");
+          throw new Error(
+            `Ambiguous model "${model}". Multiple providers match: ${candidates}. Please specify "provider/model".`
+          );
+        }
+      }
+    }
+  } else {
+    const [prov, ...rest] = model.split("/");
+    const id = rest.join("/");
+    const matched = allModels.find(
+      (m) => m.provider.toLowerCase() === prov.toLowerCase() && m.id.toLowerCase() === id.toLowerCase()
+    );
+    if (matched && typeof modelRegistry.hasConfiguredAuth === "function" && !modelRegistry.hasConfiguredAuth(matched)) {
+      throw new Error(`No authentication configured for model "${matched.provider}/${matched.id}".`);
+    }
+  }
+
+  return qualifiedModel;
+}
+
+export function toPiUsage(stats?: SubagentStats): Usage | undefined {
+  if (!stats) return undefined;
+  const input = stats.tokensIn ?? 0;
+  const output = stats.tokensOut ?? 0;
+  const cacheRead = stats.cacheRead ?? 0;
+  const cacheWrite = stats.cacheWrite ?? 0;
+  const totalTokens = stats.totalTokens ?? (input + output + cacheRead + cacheWrite);
+  const cost = stats.cost ?? 0;
+
+  if (totalTokens === 0 && cost === 0) {
+    return undefined;
+  }
+
+  return {
+    input,
+    output,
+    cacheRead,
+    cacheWrite,
+    totalTokens: totalTokens > 0 ? totalTokens : input + output + cacheRead + cacheWrite,
+    cost: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      total: cost,
+    },
+  };
+}
 
 export function buildPiArgs(options: {
   task: string;
@@ -237,7 +532,7 @@ export function buildPiArgs(options: {
   if (thinking) {
     args.push("--thinking", thinking);
   }
-  args.push("-a", options.task);
+  args.push("--", options.task);
   return args;
 }
 
@@ -267,6 +562,7 @@ export interface SpawnSubagentOptions {
     model?: string;
     reasoning?: string;
     logFile?: string;
+    errorMessage?: string;
     worktree?: any;
   }) => void;
 }
@@ -277,23 +573,28 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
   const sessionsDir = getSubagentSessionsDir();
 
   const taskText = options.task || options.prompt || "";
-  const isContinuation = Boolean(options.sessionID);
   const id = options.sessionID ?? `subagent_${randomUUID().slice(0, 8)}`;
   const logFile = path.join(subagentDir, `${id}.log`);
   const startTime = Date.now();
 
-  let modelName: string | undefined;
-  let modelReasoning: string | undefined;
-  if (typeof options.model === "string") {
-    modelName = options.model;
-  } else if (typeof options.model === "object" && options.model !== null) {
-    modelName = options.model.name || options.model.model;
-    modelReasoning = options.model.reasoning || options.model.thinking;
-  }
-  const thinking = options.reasoning ?? options.thinking ?? modelReasoning;
-
+  const parsedOption = parseModelSpec(options.model, options.reasoning, options.thinking);
   const agentProfile: AgentProfile = await resolveAgent(options.agent, options.cwd);
-  const effectiveModel = modelName ?? agentProfile.model;
+  const parsedProfileModel = parseModelSpec(agentProfile.model);
+
+  let effectiveModel = parsedOption.model ?? parsedProfileModel.model;
+  let thinking = parsedOption.thinking ?? parsedProfileModel.thinking;
+
+  if (!effectiveModel) {
+    if (options.uiContext?.model) {
+      effectiveModel = `${options.uiContext.model.provider}/${options.uiContext.model.id}`;
+    }
+    if (!thinking && options.uiContext?.thinkingLevel) {
+      thinking = options.uiContext.thinkingLevel;
+    }
+  }
+
+  // Preflight model validation (blocks invalid/ambiguous/unauthenticated models before worktree creation or spawning)
+  effectiveModel = resolveAndValidateModel(effectiveModel, options.uiContext);
 
   // Immediate abort check before allocating worktree or log file
   if (options.signal?.aborted) {
@@ -342,18 +643,43 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
   const initialLogSize = fsSync.existsSync(logFile) ? fsSync.statSync(logFile).size : 0;
   let logFd: number | undefined = fsSync.openSync(logFile, "a");
 
+  // Manage native session file with valid header and cwd matching current workDir
+  const sessionInfo = ensureSubagentSessionFile(sessionsDir, id, workDir);
+  const sessionFile = sessionInfo.sessionFile;
+  const isContinuation = Boolean(options.sessionID && sessionInfo.isExisting);
+
+  let tmpPromptDir: string | null = null;
+  let tmpPromptPath: string | null = null;
+
+  const cleanupTempPrompt = () => {
+    if (tmpPromptPath) {
+      try {
+        fsSync.unlinkSync(tmpPromptPath);
+      } catch {}
+      tmpPromptPath = null;
+    }
+    if (tmpPromptDir) {
+      try {
+        fsSync.rmdirSync(tmpPromptDir);
+      } catch {}
+      tmpPromptDir = null;
+    }
+  };
+
+  let stdoutBuffer = "";
+  let stderrBuffer = "";
   let lastLine = "";
   let aborted = false;
-  let lineBuffer = "";
   let lastAssistantText = "";
   let stderrText = "";
+  let spawnError: string | undefined;
   const parser = new SubagentEventParser();
 
   // Assemble CLI arguments for the Pi subagent process
   const args = ["--mode", "json", "-p"];
 
-  // Persistent session directory and session id for multi-turn continuation
-  args.push("--session-dir", sessionsDir, "--session-id", id);
+  // Persistent session directory and concrete session file for multi-turn continuation
+  args.push("--session-dir", sessionsDir, "--session", sessionFile);
 
   // Model override
   if (effectiveModel) {
@@ -365,9 +691,20 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
     args.push("--thinking", thinking);
   }
 
-  // Inject agent system prompt
-  if (agentProfile.system) {
-    args.push("--append-system-prompt", agentProfile.system);
+  // Inject agent system prompt via 0o600 temp file
+  if (agentProfile.system && agentProfile.system.trim()) {
+    try {
+      const tmpPrompt = await writePromptToTempFile(agentProfile.name || agentProfile.id, agentProfile.system);
+      tmpPromptDir = tmpPrompt.dir;
+      tmpPromptPath = tmpPrompt.filePath;
+      args.push("--append-system-prompt", tmpPromptPath);
+    } catch (err) {
+      cleanupTempPrompt();
+      if (worktreeInfo) {
+        await cleanupWorktree(options.cwd, worktreeInfo, "prompt temp file creation error").catch(() => {});
+      }
+      throw err;
+    }
   }
 
   // Tool whitelisting and exclusions based on agent profile
@@ -383,9 +720,10 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
     ? taskText
     : ["You are a subagent spawned by another session.", taskText].join("\n");
 
-  args.push("-a", effectivePrompt);
+  args.push("--", effectivePrompt);
 
-  const child = spawn("pi", args, {
+  const invocation = getPiInvocation(args);
+  const child = spawn(invocation.command, invocation.args, {
     cwd: workDir,
     env: {
       ...process.env,
@@ -403,6 +741,7 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
     logFd,
     logFile,
     signal: options.signal,
+    cleanupTempPrompt,
   };
 
   activeSubagentProcesses.set(id, child);
@@ -411,6 +750,7 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
   const abortHandler = () => {
     aborted = true;
     handle.isAborted = true;
+    cleanupTempPrompt();
     killProcessGroup(child);
   };
   handle.abortHandler = abortHandler;
@@ -419,90 +759,126 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
     options.signal.addEventListener("abort", abortHandler, { once: true });
   }
 
-  const flushLineBuffer = () => {
-    if (!lineBuffer.trim()) {
-      lineBuffer = "";
-      return;
-    }
-    const parsed = parser.parseLine(lineBuffer);
+  const processStdoutLine = (line: string) => {
+    if (!line.trim()) return;
+    const parsed = parser.parseLine(line);
     if (parsed) {
-      if (parsed.finalAssistantText) lastAssistantText = parsed.finalAssistantText;
-      if (logFd !== undefined && parsed.transcriptLine) {
+      if (parsed.peek) {
+        lastLine = parsed.peek;
+        globalSubagentTracker.updatePeek(id, lastLine, parsed.priority, parsed.lingerMs);
+      }
+      if (parsed.transcriptLine && logFd !== undefined) {
         try {
           fsSync.writeSync(logFd, `${parsed.transcriptLine}\n`);
         } catch {}
       }
-    } else if (logFd !== undefined && !lineBuffer.startsWith("{")) {
-      try {
-        fsSync.writeSync(logFd, `${lineBuffer}\n`);
-      } catch {}
-    }
-    lineBuffer = "";
-  };
-
-  const handleChunk = (chunk: Buffer) => {
-    const text = chunk.toString("utf-8");
-    lineBuffer += text;
-
-    const lines = lineBuffer.split("\n");
-    lineBuffer = lines.pop() ?? "";
-
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      const parsed = parser.parseLine(line);
-      if (parsed) {
-        if (parsed.peek) {
-          lastLine = parsed.peek;
-          globalSubagentTracker.updatePeek(id, lastLine, parsed.priority, parsed.lingerMs);
-        }
-        if (parsed.transcriptLine && logFd !== undefined) {
-          try {
-            fsSync.writeSync(logFd, `${parsed.transcriptLine}\n`);
-          } catch {}
-        }
-        if (parsed.finalAssistantText) {
-          lastAssistantText = parsed.finalAssistantText;
-        }
-      } else if (!line.startsWith("{")) {
-        const clean = line.replace(/[\r\n\t]+/g, " ").trim();
-        lastLine = clean;
-        globalSubagentTracker.updatePeek(id, lastLine, "normal", 1000);
-        if (logFd !== undefined) {
-          try {
-            fsSync.writeSync(logFd, `${line}\n`);
-          } catch {}
-        }
+      if (parsed.finalAssistantText) {
+        lastAssistantText = parsed.finalAssistantText;
+      }
+    } else if (!line.startsWith("{")) {
+      const clean = line.replace(/[\r\n\t]+/g, " ").trim();
+      lastLine = clean;
+      globalSubagentTracker.updatePeek(id, lastLine, "normal", 1000);
+      if (logFd !== undefined) {
+        try {
+          fsSync.writeSync(logFd, `${line}\n`);
+        } catch {}
       }
     }
   };
 
-  child.stdout?.on("data", handleChunk);
-  child.stderr?.on("data", (chunk: Buffer) => {
-    stderrText += chunk.toString("utf-8");
-    handleChunk(chunk);
-  });
+  const handleStdoutChunk = (chunk: Buffer) => {
+    stdoutBuffer += chunk.toString("utf-8");
+    const lines = stdoutBuffer.split("\n");
+    stdoutBuffer = lines.pop() ?? "";
+    for (const line of lines) {
+      processStdoutLine(line);
+    }
+  };
+
+  const handleStderrChunk = (chunk: Buffer) => {
+    stderrBuffer += chunk.toString("utf-8");
+    const lines = stderrBuffer.split("\n");
+    stderrBuffer = lines.pop() ?? "";
+    for (const rawLine of lines) {
+      const clean = stripTerminalSequences(rawLine.replace(/[\r\n\t]+/g, " ").trim());
+      if (!clean) continue;
+      stderrText += (stderrText ? "\n" : "") + clean;
+      if (logFd !== undefined) {
+        try {
+          fsSync.writeSync(logFd, `[stderr] ${clean}\n`);
+        } catch {}
+      }
+      lastLine = clean;
+      globalSubagentTracker.updatePeek(id, lastLine, "normal", 1500);
+    }
+  };
+
+  const flushBuffers = () => {
+    if (stdoutBuffer.trim()) {
+      processStdoutLine(stdoutBuffer);
+      stdoutBuffer = "";
+    }
+    if (stderrBuffer.trim()) {
+      const clean = stripTerminalSequences(stderrBuffer.replace(/[\r\n\t]+/g, " ").trim());
+      if (clean) {
+        stderrText += (stderrText ? "\n" : "") + clean;
+        if (logFd !== undefined) {
+          try {
+            fsSync.writeSync(logFd, `[stderr] ${clean}\n`);
+          } catch {}
+        }
+        lastLine = clean;
+        globalSubagentTracker.updatePeek(id, lastLine, "normal", 1500);
+      }
+      stderrBuffer = "";
+    }
+  };
+
+  child.stdout?.on("data", handleStdoutChunk);
+  child.stderr?.on("data", handleStderrChunk);
 
   const buildResultSummary = (code: number, exitStatus: string): string => {
     const stopReason = parser.getStopReason();
     const errorMsg = parser.getErrorMessage();
 
-    if (exitStatus === "failed") {
-      if (errorMsg) return `Error: ${errorMsg}`;
-      if (lastAssistantText) return lastAssistantText;
-      const stderrLines = stderrText
-        .trim()
-        .split("\n")
-        .map((l) => l.trim())
-        .filter(Boolean);
-      if (stderrLines.length > 0) {
-        return `Error: ${stderrLines.slice(-5).join("\n")}`;
+    if (exitStatus === "failed" || exitStatus === "aborted") {
+      let reason: string;
+      if (spawnError) {
+        reason = `Failed to spawn subagent process: ${spawnError}`;
+      } else if (errorMsg) {
+        reason = `Error: ${errorMsg}`;
+      } else {
+        const stderrLines = stderrText
+          .trim()
+          .split("\n")
+          .map((l) => l.trim())
+          .filter(Boolean);
+        if (stderrLines.length > 0) {
+          reason = `Error: ${stderrLines.slice(-5).join("\n")}`;
+        } else if (stopReason) {
+          reason = `Subagent ${exitStatus} with stopReason: ${stopReason}`;
+        } else {
+          reason = `Subagent exited with code ${code}`;
+        }
       }
-      return stopReason ? `Subagent failed with stopReason: ${stopReason}` : `Subagent exited with code ${code}`;
+
+      if (lastAssistantText && lastAssistantText.trim()) {
+        return `${reason}\n\nPartial output before failure:\n${lastAssistantText.trim()}`;
+      }
+      return reason;
     }
 
-    if (lastAssistantText) return lastAssistantText;
+    if (lastAssistantText && lastAssistantText.trim()) {
+      return lastAssistantText.trim();
+    }
 
-    // Read only lines appended during this run from logFile
+    if (parser.getStats().toolCalls > 0) {
+      const calls = parser.getStats().toolCalls;
+      return `(Subagent completed ${calls} tool call${calls === 1 ? "" : "s"} with no final text response)`;
+    }
+
+    // Read only human prose lines appended during this run from logFile
     try {
       if (fsSync.existsSync(logFile)) {
         const fileStat = fsSync.statSync(logFile);
@@ -514,7 +890,13 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
             fsSync.readSync(fd, buf, 0, readBytes, initialLogSize);
             const rawOutput = buf.toString("utf-8");
             const lines = rawOutput.trim().split("\n").filter(Boolean);
-            const humanLines = lines.filter((l) => !l.startsWith("{"));
+            const humanLines = lines.filter(
+              (l) =>
+                !l.startsWith("{") &&
+                !l.startsWith("-> [tool]") &&
+                !l.startsWith("<- [tool]") &&
+                !l.startsWith("[stderr]")
+            );
             const tail = humanLines.slice(-10).join("\n").trim();
             if (tail) return tail;
           } finally {
@@ -548,6 +930,8 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
       if (finished) return;
       finished = true;
 
+      cleanupTempPrompt();
+
       if (handle.suppressCallbacks) {
         return;
       }
@@ -559,7 +943,7 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
       activeSubagentProcesses.delete(id);
       activeSubagentHandles.delete(id);
 
-      flushLineBuffer();
+      flushBuffers();
 
       if (logFd !== undefined) {
         try {
@@ -572,7 +956,7 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
       const durationMs = Date.now() - startTime;
       const stopReason = parser.getStopReason();
       const errorMsg = parser.getErrorMessage();
-      const hasErrorStop = stopReason === "error" || Boolean(errorMsg);
+      const hasErrorStop = stopReason === "error" || Boolean(errorMsg) || Boolean(spawnError);
       const hasAbortedStop = stopReason === "aborted";
 
       const isSubagentAborted = aborted || handle.isAborted || hasAbortedStop;
@@ -619,6 +1003,7 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
           model: effectiveModel,
           reasoning: thinking,
           logFile,
+          errorMessage: spawnError ? `Failed to spawn subagent process: ${spawnError}` : errorMsg,
           worktree: worktreeInfo
             ? {
                 path: worktreeInfo.path,
@@ -633,7 +1018,8 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
     child.on("close", (code) => {
       void finishOnce(code ?? 0);
     });
-    child.on("error", () => {
+    child.on("error", (err) => {
+      spawnError = err instanceof Error ? err.message : String(err);
       void finishOnce(1);
     });
 
@@ -682,7 +1068,7 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
         agent: agentProfile.id,
         task: taskText,
         description: options.description,
-        model: modelName,
+        model: effectiveModel,
         reasoning: thinking,
         status: "running",
         elapsedMs: Date.now() - startTime,
@@ -704,7 +1090,8 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
         options.signal.removeEventListener("abort", abortHandler);
       }
 
-      flushLineBuffer();
+      flushBuffers();
+      cleanupTempPrompt();
 
       if (logFd !== undefined) {
         try {
@@ -715,7 +1102,8 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
       }
       resolve(code ?? 1);
     });
-    child.on("error", () => {
+    child.on("error", (err) => {
+      spawnError = err instanceof Error ? err.message : String(err);
       activeSubagentProcesses.delete(id);
       activeSubagentHandles.delete(id);
       clearInterval(progressTimer);
@@ -724,7 +1112,8 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
         options.signal.removeEventListener("abort", abortHandler);
       }
 
-      flushLineBuffer();
+      flushBuffers();
+      cleanupTempPrompt();
 
       if (logFd !== undefined) {
         try {
@@ -740,7 +1129,7 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
   const durationMs = Date.now() - startTime;
   const stopReason = parser.getStopReason();
   const errorMsg = parser.getErrorMessage();
-  const hasErrorStop = stopReason === "error" || Boolean(errorMsg);
+  const hasErrorStop = stopReason === "error" || Boolean(errorMsg) || Boolean(spawnError);
   const hasAbortedStop = stopReason === "aborted";
 
   const isSubagentAborted = aborted || handle.isAborted || hasAbortedStop;
@@ -788,7 +1177,7 @@ export async function executeSubagent(options: SpawnSubagentOptions): Promise<{ 
       model: effectiveModel,
       reasoning: thinking,
       status,
-      exitCode: isSubagentAborted ? 130 : exitCode,
+      exitCode: isSubagentAborted ? 130 : effectiveExitCode,
       durationMs,
       logFile,
       isolated: actuallyIsolated,

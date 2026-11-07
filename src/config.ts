@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import { getAgentDir, CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
 export type SubagentDisplayMode = "input" | "sidebar" | "both";
 
@@ -20,9 +21,17 @@ export const DEFAULT_SUBAGENT_SETTINGS: SubagentSettings = {
   sidebarShowAll: false,
 };
 
+function safeGetAgentDir(): string {
+  try {
+    if (typeof getAgentDir === "function") {
+      return getAgentDir();
+    }
+  } catch {}
+  return process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), ".pi", "agent");
+}
+
 function getSettingsPath(): string {
-  const agentDir = process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), ".pi", "agent");
-  return path.join(agentDir, "subagents.json");
+  return path.join(safeGetAgentDir(), "subagents.json");
 }
 
 export function loadSubagentSettings(): SubagentSettings {
